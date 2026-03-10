@@ -1,0 +1,180 @@
+name: Release COSMOS Plugin (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version number'
+        required: true
+        type: string
+      deploy_to_store:
+        description: 'Deploy to OpenC3 App Store'
+        required: false
+        type: boolean
+        default: true
+      plugin_directory:
+        description: 'Directory containing the plugin (e.g., openc3-cosmos-demo-plugin)'
+        required: true
+        type: string
+      is_tool:
+        description: 'Whether this is a tool (requires frontend build)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      OPENC3_API_TOKEN:
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate semver format
+        run: |
+          if ! echo "${{ inputs.version }}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?(\+[a-zA-Z0-9.-]+)?$'; then
+            echo "Error: Version must be a valid semver (e.g., 1.2.0, 1.2.0-beta.1)"
+            exit 1
+          fi
+
+      - name: Validate plugin directory exists
+        run: |
+          if [ ! -d "${{ inputs.plugin_directory }}" ]; then
+            echo "Error: Plugin directory '${{ inputs.plugin_directory }}' does not exist"
+            exit 1
+          fi
+
+      - name: Validate package.json exists
+        if: ${{ inputs.is_tool }}
+        run: |
+          if [ ! -f "${{ inputs.plugin_directory }}/package.json" ]; then
+            echo "Error: package.json not found in ${{ inputs.plugin_directory }}"
+            echo "Tools require a package.json file for frontend builds"
+            exit 1
+          fi
+
+      - name: Get plugin name from gemspec
+        id: plugin_info
+        working-directory: ${{ inputs.plugin_directory }}
+        run: |
+          GEMSPEC_FILE=$(ls *.gemspec | head -n1)
+          if [ -z "$GEMSPEC_FILE" ]; then
+            echo "Error: No gemspec file found in ${{ inputs.plugin_directory }}"
+            exit 1
+          fi
+          PLUGIN_NAME="${GEMSPEC_FILE%.gemspec}"
+          echo "plugin_name=$PLUGIN_NAME" >> $GITHUB_OUTPUT
+          echo "Plugin name: $PLUGIN_NAME"
+
+      - name: Set up Node.js
+        if: ${{ inputs.is_tool }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install pnpm
+        if: ${{ inputs.is_tool }}
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061
+        with:
+          version: 8
+
+      - name: Install frontend dependencies
+        if: ${{ inputs.is_tool }}
+        working-directory: ${{ inputs.plugin_directory }}
+        run: pnpm install
+
+      - name: Build frontend
+        if: ${{ inputs.is_tool }}
+        working-directory: ${{ inputs.plugin_directory }}
+        run: pnpm run build
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@6ca151fd1bfcfd6fe0c4eb6837eb0584d0134a0c # v1.290.0
+        with:
+          ruby-version: '3.2'
+
+      - name: Build gem
+        working-directory: ${{ inputs.plugin_directory }}
+        run: rake build VERSION=${{ inputs.version }}
+
+      - name: Find and set gem filename
+        id: gem_file
+        working-directory: ${{ inputs.plugin_directory }}
+        run: |
+          GEM_FILE=$(ls ${{ steps.plugin_info.outputs.plugin_name }}-*.gem)
+          echo "gem_filename=$GEM_FILE" >> $GITHUB_OUTPUT
+          echo "Found gem file: $GEM_FILE"
+
+      - name: Calculate checksum
+        id: checksum
+        working-directory: ${{ inputs.plugin_directory }}
+        run: |
+          CHECKSUM=$(shasum -a 256 ${{ steps.gem_file.outputs.gem_filename }} | cut -d' ' -f1)
+          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+          echo "Checksum: $CHECKSUM"
+
+      - name: Create and push git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ "${{ inputs.plugin_directory }}" = "." ]; then
+            TAG_NAME="v${{ inputs.version }}"
+          else
+            TAG_NAME="${{ steps.plugin_info.outputs.plugin_name }}/v${{ inputs.version }}"
+          fi
+          git tag -a "$TAG_NAME" -m "Release ${{ steps.plugin_info.outputs.plugin_name }} version ${{ inputs.version }}"
+          git push origin "$TAG_NAME"
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+        id: tag_info
+
+      - name: Upload to OpenC3 App Store
+        if: ${{ inputs.deploy_to_store }}
+        env:
+          OPENC3_API_TOKEN: ${{ secrets.OPENC3_API_TOKEN }}
+        working-directory: ${{ inputs.plugin_directory }}
+        run: |
+          response=$(curl -s -w "\n%{http_code}" -X POST "https://store.openc3.com/api/v1.1/update_plugin" \
+            -H "Authorization: Bearer $OPENC3_API_TOKEN" \
+            -F "gem_file=@${{ steps.gem_file.outputs.gem_filename }}" \
+            -F "checksum=${{ steps.checksum.outputs.checksum }}")
+
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+
+          echo "Response body:"
+          echo "$body" | jq '.' || echo "$body"
+
+          if [ "$http_code" != "201" ]; then
+            echo "Error: Upload failed with HTTP status $http_code"
+            exit 1
+          fi
+
+          echo "Plugin version ${{ inputs.version }} successfully uploaded to OpenC3 App Store!"
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag_info.outputs.tag_name }}
+          release_name: ${{ steps.plugin_info.outputs.plugin_name }} v${{ inputs.version }}
+          body: |
+            Release of ${{ steps.plugin_info.outputs.plugin_name }} version ${{ inputs.version }}
+
+            This plugin has been submitted to the OpenC3 App Store and is pending approval.
+          draft: false
+          prerelease: false
+
+      - name: Upload gem to GitHub Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./${{ inputs.plugin_directory }}/${{ steps.gem_file.outputs.gem_filename }}
+          asset_name: ${{ steps.gem_file.outputs.gem_filename }}
+          asset_content_type: application/octet-stream
