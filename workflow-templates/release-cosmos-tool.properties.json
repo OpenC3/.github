@@ -1,9 +1,9 @@
 {
     "name": "Release COSMOS Tool",
-    "description": "Builds the gem, submits to App Store, and creates a tag and release in Github.",
+    "description": "Builds the frontend, builds the gem, submits to App Store, and creates a tag and release in Github.",
     "iconName": "octicon rocket",
     "categories": [
-        "deployment"
+        "Deployment"
     ],
     "filePatterns": [
         ".*\\.gemspec$"

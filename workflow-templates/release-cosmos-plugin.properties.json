@@ -1,0 +1,11 @@
+{
+    "name": "Release COSMOS Plugin (non-tool)",
+    "description": "Builds the gem, submits to App Store, and creates a tag and release in Github.",
+    "iconName": "octicon rocket",
+    "categories": [
+        "Deployment"
+    ],
+    "filePatterns": [
+        ".*\\.gemspec$"
+    ]
+}
