@@ -14,13 +14,19 @@ on:
         default: true
       plugin_directory:
         description: 'Directory containing the plugin (e.g., openc3-cosmos-demo-plugin)'
-        required: true
+        required: false
         type: string
+        default: '.'
       is_tool:
         description: 'Whether this is a tool (requires frontend build)'
         required: false
         type: boolean
         default: false
+      frozen_lockfile:
+        description: 'Use pnpm --frozen-lockfile (ignored when is_tool is false)'
+        required: false
+        type: boolean
+        default: true
     secrets:
       OPENC3_API_TOKEN:
         required: true
@@ -84,7 +90,7 @@ jobs:
       - name: Install frontend dependencies
         if: ${{ inputs.is_tool }}
         working-directory: ${{ inputs.plugin_directory }}
-        run: pnpm install
+        run: pnpm install ${{ inputs.frozen_lockfile && '--frozen-lockfile' || '' }}
 
       - name: Build frontend
         if: ${{ inputs.is_tool }}
