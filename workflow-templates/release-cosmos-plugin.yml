@@ -1,8 +1,9 @@
 # Example workflow for non-tool (no pnpm) plugins
 # Copy this file to .github/workflows/ in the plugin repo and:
 # 1. Update the workflow name if necessary (if you're in cosmos-enterprise-plugins and have multiple release workflows)
-# 2. Update plugin_directory argument. This should be "." for single repos, and e.g. "openc3-cosmos-orbitview" for cosmos-enterprise-plugins.
-# 3. Add the OpenC3 admin accont API token to the repo secrets as OPENC3_API_TOKEN
+# 2. Update the workflow filename if necessary
+# 3. Update plugin_directory argument. This should be "." for single repos, and e.g. "openc3-cosmos-orbitview" for cosmos-enterprise-plugins.
+# 4. Add the OpenC3 admin accont API token to the repo secrets as OPENC3_API_TOKEN
 
 name: Release COSMOS Plugin
 
