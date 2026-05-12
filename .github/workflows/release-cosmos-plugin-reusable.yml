@@ -65,7 +65,9 @@ jobs:
       - name: Validate packageManager field
         if: ${{ inputs.is_tool }}
         run: |
+          cat "${{ inputs.plugin_directory }}/package.json"
           if ! grep -q '"packageManager"' "${{ inputs.plugin_directory }}/package.json"; then
+            echo $!
             echo "Error: package.json must have a 'packageManager' field (e.g., \"packageManager\": \"pnpm@10.0.0\")"
             echo "This is required for pnpm version detection in CI"
             exit 1
