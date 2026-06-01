@@ -1,0 +1,8 @@
+{
+    "name": "Copy Release to Forgejo",
+    "description": "Mirrors GitHub releases (metadata and assets) to a Forgejo instance.",
+    "iconName": "octicon mirror",
+    "categories": [
+        "Deployment"
+    ]
+}
