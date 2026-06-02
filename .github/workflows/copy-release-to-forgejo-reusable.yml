@@ -1,0 +1,113 @@
+name: Copy Release to Forgejo (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      forgejo_repo:
+        description: 'Forgejo repository path (e.g., openc3/cosmos). Defaults to openc3/<calling-repo-name>.'
+        required: false
+        type: string
+        default: ''
+      forgejo_url:
+        description: 'Forgejo server URL'
+        required: false
+        type: string
+        default: 'https://repos.openc3.com'
+      tag_name:
+        description: 'The Git tag of the release to mirror (only used for workflow_dispatch callers)'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      FORGEJO_TOKEN:
+        required: true
+
+jobs:
+  copy-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve Forgejo repo
+        id: resolve
+        run: |
+          FORGEJO_REPO="${{ inputs.forgejo_repo }}"
+          if [ -z "$FORGEJO_REPO" ]; then
+            FORGEJO_REPO="openc3/${{ github.event.repository.name }}"
+            echo "No forgejo_repo provided, defaulting to: $FORGEJO_REPO"
+          fi
+          echo "forgejo_repo=$FORGEJO_REPO" >> $GITHUB_OUTPUT
+
+      - name: Fetch and Mirror Release
+        env:
+          FORGEJO_URL: ${{ inputs.forgejo_url }}
+          FORGEJO_REPO: ${{ steps.resolve.outputs.forgejo_repo }}
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. Determine the tag name based on how the workflow was triggered
+          # (We currently always use workflow_dispatch, though.)
+          TAG_NAME="${{ inputs.tag_name }}"
+          if [ -n "$TAG_NAME" ]; then
+            echo "Tag provided via input: $TAG_NAME"
+
+            # Fetch release details via GitHub CLI
+            RELEASE_JSON=$(gh release view "$TAG_NAME" --json name,body,isDraft,isPrerelease)
+            RELEASE_NAME=$(echo "$RELEASE_JSON" | jq -r '.name')
+            RELEASE_BODY=$(echo "$RELEASE_JSON" | jq -r '.body')
+            IS_DRAFT=$(echo "$RELEASE_JSON" | jq -r '.isDraft')
+            IS_PRERELEASE=$(echo "$RELEASE_JSON" | jq -r '.isPrerelease')
+          else
+            TAG_NAME="${{ github.event.release.tag_name }}"
+            RELEASE_NAME="${{ github.event.release.name }}"
+            RELEASE_BODY="${{ github.event.release.body }}"
+            IS_DRAFT="${{ github.event.release.draft }}"
+            IS_PRERELEASE="${{ github.event.release.prerelease }}"
+            echo "Release event trigger detected for tag: $TAG_NAME"
+
+            # Give Forgejo's pull-mirror a few seconds to sync the git tag
+            sleep 15
+          fi
+
+          # 2. Create the Release Metadata on Forgejo
+          echo "Creating release narrative on Forgejo..."
+          RELEASE_DATA=$(jq -n \
+            --arg tag "$TAG_NAME" \
+            --arg name "$RELEASE_NAME" \
+            --arg body "$RELEASE_BODY" \
+            --argjson draft "$IS_DRAFT" \
+            --argjson prerelease "$IS_PRERELEASE" \
+            '{tag_name: $tag, name: $name, body: $body, draft: $draft, prerelease: $prerelease}')
+
+          RESPONSE=$(curl -s -X POST "${FORGEJO_URL}/api/v1/repos/${FORGEJO_REPO}/releases" \
+            -H "Authorization: token ${FORGEJO_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$RELEASE_DATA")
+
+          FORGEJO_RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+
+          if [ "$FORGEJO_RELEASE_ID" = "null" ] || [ -z "$FORGEJO_RELEASE_ID" ]; then
+            echo "Failed to create release. It may already exist on Forgejo."
+            echo "API Response: $RESPONSE"
+            exit 1
+          fi
+          echo "Forgejo release created successfully with ID: $FORGEJO_RELEASE_ID"
+
+          # 3. Download Assets from GitHub and Upload them to Forgejo
+          echo "Processing assets..."
+          ASSETS=$(gh release view "$TAG_NAME" --json assets --jq '.assets[].name')
+
+          for asset in $ASSETS; do
+            echo "Downloading asset from GitHub: $asset"
+            gh release download "$TAG_NAME" -p "$asset"
+
+            echo "Uploading asset to Forgejo: $asset"
+            curl -s -X POST "${FORGEJO_URL}/api/v1/repos/${FORGEJO_REPO}/releases/${FORGEJO_RELEASE_ID}/assets" \
+              -H "Authorization: token ${FORGEJO_TOKEN}" \
+              -H "Content-Type: multipart/form-data" \
+              -F "attachment=@${asset}"
+
+            rm "$asset"
+          done
+          echo "All release assets copied successfully!"
