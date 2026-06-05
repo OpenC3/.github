@@ -46,6 +46,10 @@ jobs:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 0. Trigger a Forgejo pull sync so the tag is there
+          curl -s -X POST "${FORGEJO_URL}/api/v1/repos/${FORGEJO_REPO}/mirror-sync" \
+            -H "Authorization: token ${FORGEJO_TOKEN}"
+
           # 1. Determine the tag name based on how the workflow was triggered
           # (We currently always use workflow_dispatch, though.)
           TAG_NAME="${{ inputs.tag_name }}"
