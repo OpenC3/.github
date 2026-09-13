@@ -36,6 +36,9 @@ jobs:
       deploy_to_store: ${{ inputs.deploy_to_store }}
       deploy_to_rubygems: ${{ inputs.deploy_to_rubygems }}
       plugin_directory: openc3-cosmos-tool-foo  # Update this
+      # The frontend is built whenever the plugin has a package.json. is_tool
+      # only asserts that it has one, so a missing package.json fails the
+      # release instead of publishing a gem with no tool in it.
       is_tool: true
     secrets:
       OPENC3_API_TOKEN: ${{ secrets.OPENC3_API_TOKEN }}

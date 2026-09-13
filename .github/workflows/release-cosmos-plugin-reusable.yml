@@ -23,12 +23,12 @@ on:
         type: string
         default: '.'
       is_tool:
-        description: 'Whether this is a tool (requires frontend build)'
+        description: 'Assert the plugin has a frontend, so a missing package.json fails here instead of publishing a gem with no tool in it. The frontend is built whenever a package.json is present, with or without this.'
         required: false
         type: boolean
         default: false
       frozen_lockfile:
-        description: 'Use pnpm --frozen-lockfile (ignored when is_tool is false)'
+        description: 'Use pnpm --frozen-lockfile (ignored when the plugin has no package.json)'
         required: false
         type: boolean
         default: true
@@ -85,8 +85,25 @@ jobs:
             exit 1
           fi
 
+      # The presence of a package.json - not an input - is what decides whether
+      # the frontend gets built. Gating that on is_tool meant a plugin that grew
+      # a tool or a widget and whose caller never added the flag published a gem
+      # with the frontend silently missing. is_tool is now only the assertion
+      # above: say it when you want a missing package.json to fail the release.
+      - name: Detect frontend
+        id: frontend
+        working-directory: ${{ inputs.plugin_directory }}
+        run: |
+          if [ -f package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "Frontend detected, building with pnpm"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No package.json, nothing to build"
+          fi
+
       - name: Validate packageManager field
-        if: ${{ inputs.is_tool }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         run: |
           cat "${{ inputs.plugin_directory }}/package.json"
           if ! grep -q '"packageManager"' "${{ inputs.plugin_directory }}/package.json"; then
@@ -110,24 +127,24 @@ jobs:
           echo "Plugin name: $PLUGIN_NAME"
 
       - name: Set up Node.js
-        if: ${{ inputs.is_tool }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         uses: actions/setup-node@v6
         with:
           node-version: '24'
 
       - name: Install pnpm
-        if: ${{ inputs.is_tool }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 #v5.0.0
         with:
           package_json_file: ${{ inputs.plugin_directory }}/package.json
 
       - name: Install frontend dependencies
-        if: ${{ inputs.is_tool }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         working-directory: ${{ inputs.plugin_directory }}
         run: pnpm install ${{ inputs.frozen_lockfile && '--frozen-lockfile' || '' }}
 
       - name: Build frontend
-        if: ${{ inputs.is_tool }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         working-directory: ${{ inputs.plugin_directory }}
         run: pnpm run build
 
