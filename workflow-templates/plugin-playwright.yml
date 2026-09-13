@@ -53,6 +53,7 @@ jobs:
       cosmos_version: ${{ inputs.cosmos_version || 'latest' }}
       # install_demo: true  # Uncomment if the plugin's defaults reference INST/INST2
       # is_tool: true  # Uncomment for tool plugins that need a frontend build
+      # build_frontend: true  # Uncomment for widget-only plugins that need a frontend build
       # Tool pages are opened and checked for browser console errors automatically
       # when the plugin registers a tool. Add regexes here for errors to allow:
       # console_ignore: |
