@@ -162,10 +162,13 @@ jobs:
             echo "No coverage data recorded" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          # coverage report exits non-zero when there is nothing measured and
+          # when a plugin configures fail_under, neither of which should turn
+          # into a second failure on top of whatever the test run reported
           {
             echo "## Python coverage"
             echo '```'
-            .venv/bin/python -m coverage report
+            .venv/bin/python -m coverage report || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

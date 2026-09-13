@@ -14,6 +14,9 @@
 # The Playwright harness lives in this repo under playwright-plugin/, so the
 # calling plugin needs no test files of its own.
 #
+# A frontend needs nothing declared either: a plugin with a package.json gets
+# pnpm and `pnpm install`, and `rake build` is what runs `pnpm run build`.
+#
 # Third party actions are pinned to a full commit SHA, because a tag can be moved
 # to point at different code. The comment after each pin records the tag it was.
 
@@ -48,12 +51,7 @@ on:
         type: boolean
         default: false
       is_tool:
-        description: 'Whether this is a tool (requires frontend build)'
-        required: false
-        type: boolean
-        default: false
-      build_frontend:
-        description: 'Build frontend assets for plugins such as widgets; tool plugins build automatically'
+        description: 'Whether the plugin is expected to register a COSMOS tool, which makes registering none a failure rather than a skip'
         required: false
         type: boolean
         default: false
@@ -134,7 +132,11 @@ jobs:
           set -euo pipefail
           # .env ships the defaults; .env.local is loaded after it and wins, so
           # the pinned upstream file stays untouched
-          demo=0
+          # The empty string is the one value that disables the demo on every
+          # COSMOS. Current init.sh reads OPENC3_DEMO through flag_enabled, where
+          # empty, 0 and false are all off, but older releases tested it with
+          # `[ ! -z $OPENC3_DEMO ]`, where the non-empty string 0 counts as ON.
+          demo=
           if [ "$INSTALL_DEMO" = "true" ]; then demo=1; fi
           cat > .env.local <<EOF
           OPENC3_TAG=$COSMOS_VERSION
@@ -152,26 +154,42 @@ jobs:
         with:
           node-version: 24
 
+      # A plugin's Rakefile runs `pnpm run build` itself whenever the plugin has
+      # a package.json, so the presence of that file - not an input - is what
+      # decides whether the runner needs pnpm. Asking for the flag separately
+      # only created a way to get it wrong: a widget or tool plugin whose caller
+      # forgot to set it failed later, inside `rake build`, as pnpm not found.
+      - name: Detect frontend
+        id: frontend
+        working-directory: ${{ inputs.plugin_directory }}
+        run: |
+          set -euo pipefail
+          if [ -f package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "Frontend: \`package.json\` found, building with pnpm" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "Frontend: no \`package.json\`, nothing to build" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Install pnpm
-        if: ${{ inputs.is_tool || inputs.build_frontend }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
         with:
           package_json_file: ${{ inputs.plugin_directory }}/package.json
 
       - name: Install frontend dependencies
-        if: ${{ inputs.is_tool || inputs.build_frontend }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         working-directory: ${{ inputs.plugin_directory }}
         run: pnpm install --frozen-lockfile
-
-      - name: Build frontend
-        if: ${{ inputs.is_tool || inputs.build_frontend }}
-        working-directory: ${{ inputs.plugin_directory }}
-        run: pnpm run build
 
       # openc3cli is what `rake build` shells out to for validation
       - name: Install openc3 gem
         run: gem install --no-document openc3
 
+      # There is no separate `pnpm run build` step because this one covers it:
+      # the plugin's Rakefile runs the frontend build itself when the plugin has
+      # a package.json
       - name: Build plugin gem
         id: gem
         working-directory: ${{ inputs.plugin_directory }}

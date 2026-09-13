@@ -5,6 +5,10 @@
 # 3. Update plugin_directory argument. This should be "." for single repos, and e.g. "openc3-cosmos-orbitview" for cosmos-enterprise-plugins.
 # 4. Set expected_targets to the target names your plugin defines
 # 5. Set install_demo: true if your plugin's defaults reference the demo targets (INST, INST2)
+# 6. Replace $default-branch under `push:` with your default branch name.
+#    GitHub substitutes it only when you start the workflow from the Actions
+#    tab; a hand copied file keeps the literal, which matches no branch and
+#    silently never runs on push.
 #
 # Runs the most recent COSMOS Core release in Docker, so it catches what unit
 # tests can't: a plugin.txt that doesn't parse, a target that doesn't build, a
@@ -19,7 +23,7 @@ name: Plugin Playwright
 
 on:
   push:
-    branches: [main]
+    branches: [$default-branch]
   pull_request:
     branches: ["**"]
   # Weekly against whatever COSMOS release is current, so a new COSMOS that
@@ -52,8 +56,11 @@ jobs:
       expected_targets: MY_TARGET  # Update this
       cosmos_version: ${{ inputs.cosmos_version || 'latest' }}
       # install_demo: true  # Uncomment if the plugin's defaults reference INST/INST2
-      # is_tool: true  # Uncomment for tool plugins that need a frontend build
-      # build_frontend: true  # Uncomment for widget-only plugins that need a frontend build
+      # A plugin with a package.json is built with pnpm automatically, so there
+      # is nothing to set for a tool or widget frontend. Uncomment is_tool only
+      # to assert the plugin really does register a COSMOS tool, which turns
+      # registering none from a skip into a failure.
+      # is_tool: true
       # Tool pages are opened and checked for browser console errors automatically
       # when the plugin registers a tool. Add regexes here for errors to allow:
       # console_ignore: |

@@ -25,6 +25,13 @@ const gem = path.basename(process.env.PLUGIN_GEM || '')
 const pluginName = gem.replace(/-\d[^-]*\.gem$/, '')
 const isTool = process.env.IS_TOOL === 'true'
 
+// Without this an unset PLUGIN_GEM leaves pluginName as '', and the tool filter
+// below ("does tool.plugin contain pluginName") then matches every tool COSMOS
+// has installed, silently checking the whole product instead of this plugin
+test.beforeAll(() => {
+  expect(pluginName, 'PLUGIN_GEM must be set').toBeTruthy()
+})
+
 // Errors that say nothing about the plugin. Deliberately short: every entry
 // here is a class of real breakage this test can no longer see.
 const DEFAULT_IGNORES = [
@@ -123,15 +130,27 @@ test('tool pages load without console errors', async ({ page, context }) => {
       const toolPage = await context.newPage()
       watchForErrors(toolPage, problems)
 
-      await toolPage.goto(tool.url!, { waitUntil: 'networkidle' })
-
-      // tool-base renders a catch all 404 for a tool that never registered with
-      // single-spa, which is quiet in the console. Confirm the tool actually
-      // rendered before believing a clean console means anything.
-      await expect(toolPage.locator('.v-app-bar')).toContainText(tool.name)
+      // Not networkidle: COSMOS tools poll the API and hold a cable connection
+      // open, so a tool page is never reliably idle and the wait can burn the
+      // whole test timeout. The settle and the 404 check below are what decide
+      // whether the tool actually came up.
+      await toolPage.goto(tool.url!, { waitUntil: 'domcontentloaded' })
 
       // Let deferred work (chunk loads, first data fetch) report itself
       await toolPage.waitForTimeout(5000)
+
+      // tool-base renders a catch all "404 Not Found" card for a tool that
+      // never registered with single-spa, and that is quiet in the console, so
+      // confirm it is absent before believing a clean console means anything.
+      // Deliberately not "the app bar says tool.name": a tool's title is
+      // whatever its own code hands <top-bar> and does not have to equal the
+      // name in plugin.txt - COSMOS's own tool is TOOL admin Admin and titles
+      // itself Administrator.
+      await expect(
+        toolPage.getByText('404 Not Found'),
+        `${tool.url} rendered tool-base's 404 instead of the tool`,
+      ).toHaveCount(0)
+
       await toolPage.close()
 
       if (problems.length) {

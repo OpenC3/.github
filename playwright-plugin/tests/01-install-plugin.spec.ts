@@ -42,6 +42,10 @@ test.beforeAll(() => {
 })
 
 test('installs the plugin', async ({ page }) => {
+  // The Complete assertion alone is allowed to burn INSTALL_TIMEOUT, so the
+  // test needs headroom on top of it for the navigation, upload and submit
+  test.setTimeout(INSTALL_TIMEOUT + 3 * 60 * 1000)
+
   await page.goto('/tools/admin/plugins')
   await expect(page.locator('.v-app-bar')).toContainText('Administrator')
 
@@ -65,7 +69,7 @@ test('installs the plugin', async ({ page }) => {
   // assertion: the process list is only rendered once there are processes, so
   // asserting the absence of a Running row can pass before the install has even
   // been queued. A first install reports the bare gem name, a re-install
-  // appends __<timestamp>.
+  // appends __<counter>.
   const complete = new RegExp(
     `Processing plugin_install: ${escapedGem}(__\\S+)? - Complete`,
   )
@@ -75,17 +79,28 @@ test('installs the plugin', async ({ page }) => {
   )
 
   // A failed install still leaves a process row, so confirm the plugin is
-  // actually listed rather than trusting the process output alone
+  // actually listed rather than trusting the process output alone.
+  // Deliberately "at least one" and not exactly one: COSMOS names every fresh
+  // install <gem>__<counter>, so a Playwright retry after an install that got
+  // far enough leaves two rows, and an exact count could then never pass.
   await expect(
-    page.locator('[data-test=plugin-list-item]').filter({ hasText: pluginName }),
-  ).toHaveCount(1)
+    page
+      .locator('[data-test=plugin-list-item]')
+      .filter({ hasText: pluginName })
+      .first(),
+  ).toBeVisible()
 
   for (const target of expectedTargets) {
+    // Same reason as above: match "some row for this plugin lists the target"
+    // rather than pinning it to a single row
     await expect(
       page
         .locator('[data-test=plugin-list-item]')
-        .filter({ hasText: pluginName }),
-    ).toContainText(target)
+        .filter({ hasText: pluginName })
+        .filter({ hasText: target })
+        .first(),
+      `${target} is not listed under ${pluginName}`,
+    ).toBeVisible()
   }
 })
 
@@ -105,9 +120,12 @@ test('loaded the plugin', async ({ page }) => {
 
   await expect(page.getByRole('dialog')).toContainText('Process Output')
   // openc3cli logs "Loading new plugin: <path>", and the path is not always
-  // just the filename, so don't anchor the gem name to the colon
+  // just the filename, so don't anchor the gem name to the colon. On a
+  // Playwright retry (or against a stack that already has the plugin) local
+  // mode routes the same gem down the upgrade path, which logs
+  // "Updating existing plugin: <name> with <gem>" instead.
   await expect(page.getByRole('dialog')).toContainText(
-    new RegExp(`Loading new plugin: .*${escapedGem}`),
+    new RegExp(`(Loading new plugin|Updating existing plugin): .*${escapedGem}`),
   )
   await page.getByRole('button', { name: 'Ok' }).click()
 })

@@ -138,13 +138,27 @@ jobs:
 
       - name: Build gem
         working-directory: ${{ inputs.plugin_directory }}
-        run: rake build VERSION=${{ inputs.version }}
+        run: |
+          # Some plugins have a built gem committed at the plugin root. Clear any
+          # out first so the glob below can only match what this build produced;
+          # otherwise a stale gem sorts first and gets published in place of the
+          # version being released. Only the plugin root is touched, so gems
+          # vendored in subdirectories are left alone.
+          rm -f ./*.gem
+          rake build VERSION=${{ inputs.version }}
 
       - name: Find and set gem filename
         id: gem_file
         working-directory: ${{ inputs.plugin_directory }}
         run: |
-          GEM_FILE=$(ls ${{ steps.plugin_info.outputs.plugin_name }}-*.gem)
+          shopt -s nullglob
+          GEM_FILES=(./${{ steps.plugin_info.outputs.plugin_name }}-*.gem)
+          if [ ${#GEM_FILES[@]} -ne 1 ]; then
+            echo "Error: Expected exactly one gem after the build, found ${#GEM_FILES[@]}"
+            ls -la ./*.gem || true
+            exit 1
+          fi
+          GEM_FILE=$(basename "${GEM_FILES[0]}")
           echo "gem_filename=$GEM_FILE" >> $GITHUB_OUTPUT
           echo "Found gem file: $GEM_FILE"
 

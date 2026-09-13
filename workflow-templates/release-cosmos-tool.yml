@@ -6,7 +6,7 @@
 # 4. Add the OpenC3 admin accont API token to the repo secrets as OPENC3_API_TOKEN
 # 5. To publish to RubyGems, add your RubyGems API key to the repo secrets as
 #    RUBYGEMS_API_KEY and check 'Publish the gem to RubyGems' when you run this
-# 5. Make sure pnpm-workspace.yaml has the `packages` field defined
+# 6. Make sure pnpm-workspace.yaml has the `packages` field defined
 
 name: Release COSMOS Tool
 

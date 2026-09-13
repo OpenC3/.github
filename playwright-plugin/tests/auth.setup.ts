@@ -21,11 +21,20 @@ import { STORAGE_STATE } from '../playwright.config'
 
 const PASSWORD = process.env.COSMOS_PASSWORD || 'password'
 
-// init.sh installs the tools one at a time, so the admin tool being present in
-// the import map is the signal that COSMOS is far enough along to drive. A tool
-// that isn't in the map is never registered with single-spa and tool-base
-// renders its 404 instead, which a spec only sees as a missing app bar.
-async function waitForAdminTool(page: Page) {
+// init.sh installs the plugins one at a time, so a tool appearing in the import
+// map only means init.sh got that far. A tool that isn't in the map is never
+// registered with single-spa and tool-base renders its 404 instead, which a
+// spec only sees as a missing app bar.
+//
+// The marker has to be the LAST inline tool init.sh loads, not the first one we
+// happen to need: tool-admin is loaded well before the demo plugin and before
+// cmdtlmserver, so waiting on admin would let the specs start while INST/INST2
+// don't exist yet and /tools/cmdtlmserver still 404s. bucketexplorer is the
+// last tool init.sh loads that gets an import map entry (docs is iframe based),
+// which is the same marker the COSMOS repo's own suite waits on.
+const READY_MARKER = '@openc3/tool-bucketexplorer'
+
+async function waitForTools(page: Page) {
   await expect
     .poll(
       async () => {
@@ -33,13 +42,13 @@ async function waitForAdminTool(page: Page) {
           const response = await page.request.get('/openc3-api/map.json')
           if (!response.ok()) return false
           const imports = (await response.json()).imports || {}
-          return '@openc3/tool-admin' in imports
+          return READY_MARKER in imports
         } catch {
           return false
         }
       },
       {
-        message: 'waiting for @openc3/tool-admin in the import map',
+        message: `waiting for ${READY_MARKER} in the import map`,
         timeout: 12 * 60 * 1000,
         intervals: [5000],
       },
@@ -50,7 +59,7 @@ async function waitForAdminTool(page: Page) {
 setup('sign in', async ({ page }) => {
   setup.setTimeout(20 * 60 * 1000)
 
-  await waitForAdminTool(page)
+  await waitForTools(page)
 
   await page.goto('/tools/cmdtlmserver')
 
