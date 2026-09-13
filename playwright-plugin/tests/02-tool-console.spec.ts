@@ -62,13 +62,13 @@ interface Tool {
 // request has to be made from inside the page
 async function fetchTools(page: Page): Promise<Tool[]> {
   const result = await page.evaluate(async () => {
-    const response = await fetch('/openc3-api/tools?scope=DEFAULT', {
+    const response = await fetch('/openc3-api/tools/all?scope=DEFAULT', {
       headers: { Authorization: localStorage.openc3Token },
     })
     if (!response.ok) return { error: `${response.status}` }
     return { data: await response.json() }
   })
-  expect(result.error, 'could not read /openc3-api/tools').toBeUndefined()
+  expect(result.error, 'could not read /openc3-api/tools/all').toBeUndefined()
   // The API returns a hash of folder_name => tool
   const data = result.data as Record<string, Tool> | Tool[]
   return Array.isArray(data) ? data : Object.values(data)

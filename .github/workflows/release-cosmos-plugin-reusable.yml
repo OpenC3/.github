@@ -72,7 +72,7 @@ jobs:
             echo "Error: deploy_to_rubygems is true but the RUBYGEMS_API_KEY secret is empty"
             echo "Add the key to the repo secrets and pass it through, e.g."
             echo "  secrets:"
-            echo "    RUBYGEMS_API_KEY: \${{ secrets.RUBYGEMS_API_KEY }}"
+            echo '    RUBYGEMS_API_KEY: $''{{ secrets.RUBYGEMS_API_KEY }}'
             exit 1
           fi
 
@@ -118,6 +118,8 @@ jobs:
       - name: Install pnpm
         if: ${{ inputs.is_tool }}
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 #v5.0.0
+        with:
+          package_json_file: ${{ inputs.plugin_directory }}/package.json
 
       - name: Install frontend dependencies
         if: ${{ inputs.is_tool }}

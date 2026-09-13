@@ -150,11 +150,18 @@ jobs:
       - name: Install pnpm
         if: ${{ inputs.is_tool }}
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+        with:
+          package_json_file: ${{ inputs.plugin_directory }}/package.json
 
       - name: Install frontend dependencies
         if: ${{ inputs.is_tool }}
         working-directory: ${{ inputs.plugin_directory }}
         run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        if: ${{ inputs.is_tool }}
+        working-directory: ${{ inputs.plugin_directory }}
+        run: pnpm run build
 
       # openc3cli is what `rake build` shells out to for validation
       - name: Install openc3 gem
@@ -212,7 +219,7 @@ jobs:
         working-directory: .openc3-shared/playwright-plugin
         run: |
           set -euo pipefail
-          npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npx playwright install --with-deps chromium
 
       - name: Install the plugin with Playwright
