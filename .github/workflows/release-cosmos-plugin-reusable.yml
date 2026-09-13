@@ -12,6 +12,11 @@ on:
         required: false
         type: boolean
         default: true
+      deploy_to_rubygems:
+        description: 'Publish the gem to RubyGems (requires the RUBYGEMS_API_KEY secret)'
+        required: false
+        type: boolean
+        default: false
       plugin_directory:
         description: 'Directory containing the plugin (e.g., openc3-cosmos-demo-plugin)'
         required: false
@@ -30,6 +35,9 @@ on:
     secrets:
       OPENC3_API_TOKEN:
         required: true
+      RUBYGEMS_API_KEY:
+        description: 'RubyGems API key, only needed when deploy_to_rubygems is true'
+        required: false
 
 jobs:
   release:
@@ -50,6 +58,21 @@ jobs:
         run: |
           if [ ! -d "${{ inputs.plugin_directory }}" ]; then
             echo "Error: Plugin directory '${{ inputs.plugin_directory }}' does not exist"
+            exit 1
+          fi
+
+      # Checked up front rather than at the push step, which runs after the tag
+      # has been pushed and the App Store upload has already happened
+      - name: Validate RubyGems credentials
+        if: ${{ inputs.deploy_to_rubygems }}
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: |
+          if [ -z "$GEM_HOST_API_KEY" ]; then
+            echo "Error: deploy_to_rubygems is true but the RUBYGEMS_API_KEY secret is empty"
+            echo "Add the key to the repo secrets and pass it through, e.g."
+            echo "  secrets:"
+            echo "    RUBYGEMS_API_KEY: \${{ secrets.RUBYGEMS_API_KEY }}"
             exit 1
           fi
 
@@ -168,6 +191,17 @@ jobs:
           fi
 
           echo "Plugin version ${{ inputs.version }} successfully uploaded to OpenC3 App Store!"
+
+      # gem push reads the credential from GEM_HOST_API_KEY, so nothing is
+      # written to ~/.gem/credentials on the runner
+      - name: Publish to RubyGems
+        if: ${{ inputs.deploy_to_rubygems }}
+        working-directory: ${{ inputs.plugin_directory }}
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: |
+          gem push "${{ steps.gem_file.outputs.gem_filename }}"
+          echo "Plugin version ${{ inputs.version }} successfully pushed to RubyGems!"
 
       - name: Create GitHub Release
         id: create_release

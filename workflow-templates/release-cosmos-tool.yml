@@ -4,6 +4,8 @@
 # 2. Update the workflow filename if necessary
 # 3. Update plugin_directory argument. This should be "." for single repos, and e.g. "openc3-cosmos-orbitview" for cosmos-enterprise-plugins.
 # 4. Add the OpenC3 admin accont API token to the repo secrets as OPENC3_API_TOKEN
+# 5. To publish to RubyGems, add your RubyGems API key to the repo secrets as
+#    RUBYGEMS_API_KEY and check 'Publish the gem to RubyGems' when you run this
 # 5. Make sure pnpm-workspace.yaml has the `packages` field defined
 
 name: Release COSMOS Tool
@@ -20,6 +22,11 @@ on:
         required: false
         type: boolean
         default: true
+      deploy_to_rubygems:
+        description: 'Publish the gem to RubyGems'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   release:
@@ -27,7 +34,9 @@ jobs:
     with:
       version: ${{ inputs.version }}
       deploy_to_store: ${{ inputs.deploy_to_store }}
+      deploy_to_rubygems: ${{ inputs.deploy_to_rubygems }}
       plugin_directory: openc3-cosmos-tool-foo  # Update this
       is_tool: true
     secrets:
       OPENC3_API_TOKEN: ${{ secrets.OPENC3_API_TOKEN }}
+      RUBYGEMS_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}

@@ -1,0 +1,32 @@
+# Runs a plugin's unit tests on every push and pull request.
+# Copy this file to .github/workflows/ in the plugin repo and:
+# 1. Update the workflow name if necessary (if you're in cosmos-enterprise-plugins and have multiple plugins)
+# 2. Update the workflow filename if necessary
+# 3. Update plugin_directory argument. This should be "." for single repos, and e.g. "openc3-cosmos-orbitview" for cosmos-enterprise-plugins.
+#
+# Python tests are discovered in tests/ or test/, Ruby specs in spec/ or specs/.
+# Whichever the plugin doesn't have is skipped, so there is nothing else to set.
+
+name: Plugin Unit Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    uses: OpenC3/.github/.github/workflows/plugin-unit-tests-reusable.yml@main
+    with:
+      plugin_directory: .  # Update this
+      # python_version: '3.12'  # Uncomment and update if needed
+      # ruby_version: '3.4'  # Uncomment and update if needed
+      # require_tests: true  # Uncomment to fail the build when the plugin has no tests

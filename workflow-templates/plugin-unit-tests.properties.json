@@ -1,0 +1,11 @@
+{
+    "name": "Plugin Unit Tests",
+    "description": "Runs Python tests in tests/ or test/ and Ruby specs in spec/ or specs/ on every push and pull request.",
+    "iconName": "octicon beaker",
+    "categories": [
+        "Testing"
+    ],
+    "filePatterns": [
+        ".*\\.gemspec$"
+    ]
+}

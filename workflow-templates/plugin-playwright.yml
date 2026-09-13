@@ -1,0 +1,60 @@
+# Builds the plugin and installs it into a real COSMOS with Playwright.
+# Copy this file to .github/workflows/ in the plugin repo and:
+# 1. Update the workflow name if necessary (if you're in cosmos-enterprise-plugins and have multiple plugins)
+# 2. Update the workflow filename if necessary
+# 3. Update plugin_directory argument. This should be "." for single repos, and e.g. "openc3-cosmos-orbitview" for cosmos-enterprise-plugins.
+# 4. Set expected_targets to the target names your plugin defines
+# 5. Set install_demo: true if your plugin's defaults reference the demo targets (INST, INST2)
+#
+# Runs the most recent COSMOS Core release in Docker, so it catches what unit
+# tests can't: a plugin.txt that doesn't parse, a target that doesn't build, a
+# microservice that won't start. Plugins that register a COSMOS tool also get
+# each tool page opened and checked for browser console errors. Runs on every
+# commit and once a week, the weekly run being what catches a new COSMOS
+# release breaking the plugin.
+#
+# GitHub disables scheduled workflows in a repo with no activity for 60 days.
+
+name: Plugin Playwright
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ["**"]
+  # Weekly against whatever COSMOS release is current, so a new COSMOS that
+  # breaks the plugin surfaces even when nothing here has changed. Off the hour
+  # because scheduled runs at :00 get queued behind everyone else's.
+  schedule:
+    - cron: '27 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      cosmos_version:
+        description: 'COSMOS version to run, or latest'
+        required: false
+        type: string
+        default: 'latest'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseding a pull request run is fine, but a scheduled run and a push to
+  # main share a ref, so cancelling on those would have them kill each other
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  playwright:
+    uses: OpenC3/.github/.github/workflows/plugin-playwright-reusable.yml@main
+    with:
+      plugin_directory: .  # Update this
+      expected_targets: MY_TARGET  # Update this
+      cosmos_version: ${{ inputs.cosmos_version || 'latest' }}
+      # install_demo: true  # Uncomment if the plugin's defaults reference INST/INST2
+      # is_tool: true  # Uncomment for tool plugins that need a frontend build
+      # Tool pages are opened and checked for browser console errors automatically
+      # when the plugin registers a tool. Add regexes here for errors to allow:
+      # console_ignore: |
+      #   some third party gripe
+      #   another known message
