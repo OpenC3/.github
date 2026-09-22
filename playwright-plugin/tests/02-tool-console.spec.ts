@@ -102,8 +102,10 @@ test('tool pages load without console errors', async ({ page, context }) => {
   const all = await fetchTools(page)
   const mine = all.filter((tool) => (tool.plugin || '').includes(pluginName))
 
-  // IFRAME and NEW tools point somewhere else, so their console says nothing
-  // about this plugin. INLINE tools are the ones COSMOS itself renders.
+  // WINDOW is INLINE, IFRAME, SAME or NEW (see ToolModel). Only INLINE tools are
+  // mounted by COSMOS itself as a single-spa app, so only their console says
+  // anything about this plugin. IFRAME embeds, and SAME (a plain link in the
+  // current tab) and NEW (a new tab) navigate to, a page COSMOS doesn't render.
   const checkable = mine.filter(
     (tool) => tool.window === 'INLINE' && tool.url && tool.url.startsWith('/'),
   )
@@ -120,7 +122,7 @@ test('tool pages load without console errors', async ({ page, context }) => {
 
   test.skip(
     checkable.length === 0,
-    `${pluginName} ships only IFRAME/NEW tools, which render outside COSMOS`,
+    `${pluginName} ships only IFRAME/SAME/NEW tools, which render outside COSMOS`,
   )
 
   const failures: string[] = []

@@ -12,7 +12,7 @@
 // PLUGIN_GEM       path to the .gem file to install (required)
 // EXPECTED_TARGETS space separated target names the plugin should define (optional)
 
-import { test, expect } from '@playwright/test'
+import { test, expect, type Page } from '@playwright/test'
 import * as fs from 'fs'
 import * as path from 'path'
 
@@ -36,13 +36,26 @@ const escapedGem = escapeRegExp(gem)
 // runner pulling images is minutes rather than seconds
 const INSTALL_TIMEOUT = 10 * 60 * 1000
 
+// Every final state a COSMOS process can report. A first install reports the
+// bare gem name, a re-install appends __<counter>.
+const FINISHED = new RegExp(
+  `^Processing plugin_install: ${escapedGem}(__\\S+)? - (Complete|Warning|Error|Crashed|Expired)$`,
+)
+
+async function readFinishedInstalls(page: Page) {
+  const rows = await page
+    .locator('[data-test=process-list] .v-list-item-title')
+    .allInnerTexts()
+  return rows.map((row) => row.trim()).filter((row) => FINISHED.test(row))
+}
+
 test.beforeAll(() => {
   expect(gemPath, 'PLUGIN_GEM must be set').toBeTruthy()
   expect(fs.existsSync(gemPath), `${gemPath} does not exist`).toBe(true)
 })
 
 test('installs the plugin', async ({ page }) => {
-  // The Complete assertion alone is allowed to burn INSTALL_TIMEOUT, so the
+  // Waiting for the install to finish alone is allowed to burn INSTALL_TIMEOUT, so the
   // test needs headroom on top of it for the navigation, upload and submit
   test.setTimeout(INSTALL_TIMEOUT + 3 * 60 * 1000)
 
@@ -59,24 +72,51 @@ test('installs the plugin', async ({ page }) => {
   // Every plugin gets the variables dialog, even with no VARIABLEs to set.
   // Submitting takes the defaults from plugin.txt.
   await expect(page.locator('.v-dialog:has-text("Variables")')).toBeVisible()
+
+  // The process list keeps the last 10 minutes of activity in no particular
+  // order, so on a Playwright retry it still holds the first attempt's rows.
+  // Snapshot the finished ones now so only this attempt's result is judged.
+  const finishedRows = await readFinishedInstalls(page)
+
   await page.locator('data-test=edit-submit').click()
 
   await expect(page.locator('[data-test=plugin-alert]')).toContainText(
     'Started installing',
   )
 
-  // Wait for the install process to report Complete. Deliberately a positive
-  // assertion: the process list is only rendered once there are processes, so
-  // asserting the absence of a Running row can pass before the install has even
-  // been queued. A first install reports the bare gem name, a re-install
-  // appends __<counter>.
-  const complete = new RegExp(
-    `Processing plugin_install: ${escapedGem}(__\\S+)? - Complete`,
-  )
-  await expect(page.locator('[data-test=process-list]')).toContainText(
-    complete,
-    { timeout: INSTALL_TIMEOUT },
-  )
+  // Wait for the install process to reach any final state, so an Error or
+  // Crashed install fails immediately instead of burning INSTALL_TIMEOUT waiting
+  // for a Complete that will never come. Deliberately a positive check: the
+  // process list is only rendered once there are processes, so asserting the
+  // absence of a Running row can pass before the install has even been queued.
+  let state: string | undefined
+  await expect
+    .poll(
+      async () => {
+        const fresh = [...(await readFinishedInstalls(page))]
+        for (const row of finishedRows) {
+          const index = fresh.indexOf(row)
+          if (index !== -1) fresh.splice(index, 1)
+        }
+        state = fresh[0]?.match(FINISHED)?.[2]
+        return state
+      },
+      {
+        message: `plugin_install of ${gem} never finished`,
+        timeout: INSTALL_TIMEOUT,
+        intervals: [2000],
+      },
+    )
+    .toBeTruthy()
+
+  // Warning means the plugin installed but something along the way deserves a
+  // look, so it passes. Error, Crashed and Expired are failures.
+  expect(
+    state,
+    `plugin_install finished with ${state}:\n${await page
+      .locator('[data-test=process-list]')
+      .innerText()}`,
+  ).toMatch(/^(Complete|Warning)$/)
 
   // A failed install still leaves a process row, so confirm the plugin is
   // actually listed rather than trusting the process output alone.

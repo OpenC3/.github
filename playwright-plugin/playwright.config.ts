@@ -11,8 +11,10 @@ export default defineConfig({
   expect: {
     timeout: 30 * 1000,
   },
-  // Has to leave room for the setup budget (20 min) plus the install test and
-  // its one retry, and still finish inside the workflow's 45 minute job timeout
+  // Covers the Playwright step only: the setup budget (20 min) plus the install
+  // test and its one retry. The workflow's 75 minute job timeout adds room on
+  // top for checkout, the gem build and starting COSMOS, which together can
+  // take 20 minutes on their own.
   globalTimeout: 40 * 60 * 1000,
   forbidOnly: !!process.env.CI,
   // COSMOS and the browser share one runner, so a starved event loop can freeze

@@ -1,0 +1,85 @@
+# Checks this repo's own files: the reusable workflows and templates it hands to
+# plugin repos, and the Playwright harness those workflows check out. Nothing
+# here needs COSMOS running - the harness is exercised for real by each plugin's
+# Playwright run - so this catches the mistakes that are cheap to catch early:
+# a workflow that doesn't parse, a template whose JSON is broken, a spec that
+# doesn't compile.
+#
+# Third party actions are pinned to a full commit SHA, because a tag can be moved
+# to point at different code. The comment after each pin records the tag it was.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
+          # The templates are workflows too, just ones GitHub copies into plugin
+          # repos rather than runs here
+          ./actionlint -color .github/workflows/*.yml workflow-templates/*.yml
+
+      - name: Validate template metadata
+        run: |
+          set -euo pipefail
+          for file in workflow-templates/*.properties.json; do
+            jq empty "$file"
+          done
+          # GitHub only offers a template that has a properties file beside it
+          for file in workflow-templates/*.yml; do
+            if [ ! -f "${file%.yml}.properties.json" ]; then
+              echo "::error file=$file::Missing ${file%.yml}.properties.json"
+              exit 1
+            fi
+          done
+
+  playwright-harness:
+    name: Check Playwright harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: playwright-plugin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Loads the config and every spec the way a real run would, so a broken
+      # import or project wiring fails here. No browser is needed to list.
+      - name: List tests
+        env:
+          PLUGIN_GEM: /nonexistent/openc3-cosmos-example-1.0.0.gem
+        run: npm run list

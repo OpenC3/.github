@@ -82,7 +82,9 @@ jobs:
   playwright:
     name: Install plugin in COSMOS
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Checkout, the gem build and starting COSMOS can take 20 minutes before
+    # Playwright starts, and Playwright's own globalTimeout is 40
+    timeout-minutes: 75
     steps:
       - name: Checkout plugin
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
