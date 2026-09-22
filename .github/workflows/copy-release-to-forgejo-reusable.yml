@@ -37,7 +37,7 @@ jobs:
             FORGEJO_REPO="openc3/${{ github.event.repository.name }}"
             echo "No forgejo_repo provided, defaulting to: $FORGEJO_REPO"
           fi
-          echo "forgejo_repo=$FORGEJO_REPO" >> $GITHUB_OUTPUT
+          echo "forgejo_repo=$FORGEJO_REPO" >> "$GITHUB_OUTPUT"
 
       - name: Fetch and Mirror Release
         env:

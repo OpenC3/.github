@@ -117,13 +117,15 @@ jobs:
         id: plugin_info
         working-directory: ${{ inputs.plugin_directory }}
         run: |
-          GEMSPEC_FILE=$(ls *.gemspec | head -n1)
-          if [ -z "$GEMSPEC_FILE" ]; then
+          shopt -s nullglob
+          GEMSPEC_FILES=(./*.gemspec)
+          GEMSPEC_FILE=$(basename "${GEMSPEC_FILES[0]:-}")
+          if [ ${#GEMSPEC_FILES[@]} -eq 0 ]; then
             echo "Error: No gemspec file found in ${{ inputs.plugin_directory }}"
             exit 1
           fi
           PLUGIN_NAME="${GEMSPEC_FILE%.gemspec}"
-          echo "plugin_name=$PLUGIN_NAME" >> $GITHUB_OUTPUT
+          echo "plugin_name=$PLUGIN_NAME" >> "$GITHUB_OUTPUT"
           echo "Plugin name: $PLUGIN_NAME"
 
       - name: Set up Node.js
@@ -176,15 +178,15 @@ jobs:
             exit 1
           fi
           GEM_FILE=$(basename "${GEM_FILES[0]}")
-          echo "gem_filename=$GEM_FILE" >> $GITHUB_OUTPUT
+          echo "gem_filename=$GEM_FILE" >> "$GITHUB_OUTPUT"
           echo "Found gem file: $GEM_FILE"
 
       - name: Calculate checksum
         id: checksum
         working-directory: ${{ inputs.plugin_directory }}
         run: |
-          CHECKSUM=$(shasum -a 256 ${{ steps.gem_file.outputs.gem_filename }} | cut -d' ' -f1)
-          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+          CHECKSUM=$(shasum -a 256 "${{ steps.gem_file.outputs.gem_filename }}" | cut -d' ' -f1)
+          echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
           echo "Checksum: $CHECKSUM"
 
       - name: Create and push git tag
@@ -198,7 +200,7 @@ jobs:
           fi
           git tag -a "$TAG_NAME" -m "Release ${{ steps.plugin_info.outputs.plugin_name }} version ${{ inputs.version }}"
           git push origin "$TAG_NAME"
-          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
         id: tag_info
 
       - name: Upload to OpenC3 App Store
