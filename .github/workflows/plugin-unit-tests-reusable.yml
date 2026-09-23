@@ -1,0 +1,213 @@
+# Generic unit tests for COSMOS plugins.
+#
+# Runs Python tests found in tests/ or test/ and Ruby specs found in spec/ or
+# specs/. A plugin with only one kind of test skips the other job, and a plugin
+# with neither passes with a warning unless require-tests is set.
+#
+# Dependencies are picked up automatically: requirements.txt for the plugin's own
+# imports, <test dir>/requirements.txt for test only ones, and a Gemfile for Ruby
+# when there is one, otherwise the openc3 and rspec gems. There is nothing to
+# configure per plugin unless it lives in a subdirectory of a monorepo, in which
+# case set plugin_directory.
+#
+# Third party actions are pinned to a full commit SHA, because a tag can be moved
+# to point at different code. The comment after each pin records the tag it was.
+
+name: Plugin Unit Tests (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      plugin_directory:
+        description: 'Directory containing the plugin (e.g., openc3-cosmos-demo-plugin)'
+        required: false
+        type: string
+        default: '.'
+      python_version:
+        description: 'Python version used for the Python tests'
+        required: false
+        type: string
+        default: '3.12'
+      ruby_version:
+        description: 'Ruby version used for the Ruby specs'
+        required: false
+        type: string
+        default: '3.4'
+      require_tests:
+        description: 'Fail when the plugin has no tests at all, rather than passing quietly'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Work out which kinds of tests this plugin actually has, so the language jobs
+  # below skip rather than fail on a plugin which has none of that kind.
+  detect:
+    name: Detect tests
+    runs-on: ubuntu-latest
+    outputs:
+      python-dir: ${{ steps.detect.outputs.python-dir }}
+      ruby-dir: ${{ steps.detect.outputs.ruby-dir }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate plugin directory exists
+        run: |
+          if [ ! -d "${{ inputs.plugin_directory }}" ]; then
+            echo "Error: Plugin directory '${{ inputs.plugin_directory }}' does not exist"
+            exit 1
+          fi
+
+      - name: Detect test directories
+        id: detect
+        working-directory: ${{ inputs.plugin_directory }}
+        env:
+          REQUIRE_TESTS: ${{ inputs.require_tests }}
+        run: |
+          set -euo pipefail
+
+          # A directory only counts when it actually holds test files, so an empty
+          # or unrelated tests/ directory doesn't make the job fail with no tests
+          first_dir_containing() {
+            local pattern=$1
+            shift
+            for candidate in "$@"; do
+              if [ -d "$candidate" ] && [ -n "$(find "$candidate" -name "$pattern" -print -quit)" ]; then
+                echo "$candidate"
+                return
+              fi
+            done
+          }
+
+          python_dir=$(first_dir_containing 'test_*.py' tests test)
+          if [ -z "$python_dir" ]; then
+            python_dir=$(first_dir_containing '*_test.py' tests test)
+          fi
+          ruby_dir=$(first_dir_containing '*_spec.rb' spec specs)
+
+          echo "python-dir=$python_dir" >> "$GITHUB_OUTPUT"
+          echo "ruby-dir=$ruby_dir" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Detected tests"
+            echo "- Python: ${python_dir:-none}"
+            echo "- Ruby: ${ruby_dir:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$python_dir" ] && [ -z "$ruby_dir" ]; then
+            if [ "${REQUIRE_TESTS:-false}" = "true" ]; then
+              echo "::error::No tests found in tests/, test/, spec/ or specs/"
+              exit 1
+            fi
+            echo "::warning::No tests found in tests/, test/, spec/ or specs/"
+          fi
+
+  python:
+    name: Python tests
+    needs: detect
+    if: needs.detect.outputs.python-dir != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          python-version: ${{ inputs.python_version }}
+
+      - name: Create virtual environment
+        working-directory: ${{ inputs.plugin_directory }}
+        run: uv venv .venv
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.plugin_directory }}
+        env:
+          TEST_DIR: ${{ needs.detect.outputs.python-dir }}
+        run: |
+          set -euo pipefail
+          uv pip install --python .venv/bin/python pytest coverage openc3
+          # The plugin's own runtime dependencies, which the code under test imports
+          if [ -f requirements.txt ]; then
+            uv pip install --python .venv/bin/python -r requirements.txt
+          fi
+          # Dependencies needed only by the tests
+          if [ -f "$TEST_DIR/requirements.txt" ]; then
+            uv pip install --python .venv/bin/python -r "$TEST_DIR/requirements.txt"
+          fi
+
+      - name: Run tests
+        working-directory: ${{ inputs.plugin_directory }}
+        env:
+          TEST_DIR: ${{ needs.detect.outputs.python-dir }}
+        run: .venv/bin/python -m coverage run -m pytest "$TEST_DIR" -v
+
+      - name: Coverage
+        # Report coverage even when a test failed, but don't add a second, more
+        # confusing failure when the run never got far enough to record any
+        if: ${{ !cancelled() }}
+        working-directory: ${{ inputs.plugin_directory }}
+        run: |
+          set -euo pipefail
+          if [ ! -f .coverage ]; then
+            echo "No coverage data recorded" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # coverage report exits non-zero when there is nothing measured and
+          # when a plugin configures fail_under, neither of which should turn
+          # into a second failure on top of whatever the test run reported
+          {
+            echo "## Python coverage"
+            echo '```'
+            .venv/bin/python -m coverage report || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ruby:
+    name: Ruby specs
+    needs: detect
+    if: needs.detect.outputs.ruby-dir != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          working-directory: ${{ inputs.plugin_directory }}
+          # Caching bundler needs a lockfile to key on, and most plugins have no
+          # Gemfile at all, in which case the gems are installed directly below
+          bundler-cache: ${{ hashFiles(format('{0}/Gemfile.lock', inputs.plugin_directory)) != '' }}
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.plugin_directory }}
+        run: |
+          set -euo pipefail
+          if [ -f Gemfile ]; then
+            bundle install --jobs 4 --retry 3
+          else
+            gem install --no-document rspec openc3
+          fi
+
+      - name: Run specs
+        working-directory: ${{ inputs.plugin_directory }}
+        env:
+          SPEC_DIR: ${{ needs.detect.outputs.ruby-dir }}
+        run: |
+          set -euo pipefail
+          if [ -f Gemfile ]; then
+            bundle exec rspec "$SPEC_DIR" --format documentation
+          else
+            rspec "$SPEC_DIR" --format documentation
+          fi

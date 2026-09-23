@@ -1,0 +1,11 @@
+{
+    "name": "Plugin Playwright",
+    "description": "Runs the latest COSMOS Core release in Docker, builds the plugin, and installs it through the Admin tool with Playwright.",
+    "iconName": "octicon container",
+    "categories": [
+        "Testing"
+    ],
+    "filePatterns": [
+        ".*\\.gemspec$"
+    ]
+}

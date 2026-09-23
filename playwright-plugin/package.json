@@ -1,0 +1,18 @@
+{
+  "name": "openc3-plugin-playwright",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Installs a COSMOS plugin into a running COSMOS and verifies it came up",
+  "scripts": {
+    "test": "playwright test --project=chromium",
+    "typecheck": "tsc",
+    "list": "playwright test --list"
+  },
+  "dependencies": {
+    "@playwright/test": "1.62.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.6",
+    "typescript": "7.0.2"
+  }
+}

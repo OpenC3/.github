@@ -12,24 +12,32 @@ on:
         required: false
         type: boolean
         default: true
+      deploy_to_rubygems:
+        description: 'Publish the gem to RubyGems (requires the RUBYGEMS_API_KEY secret)'
+        required: false
+        type: boolean
+        default: false
       plugin_directory:
         description: 'Directory containing the plugin (e.g., openc3-cosmos-demo-plugin)'
         required: false
         type: string
         default: '.'
       is_tool:
-        description: 'Whether this is a tool (requires frontend build)'
+        description: 'Assert the plugin has a frontend, so a missing package.json fails here instead of publishing a gem with no tool in it. The frontend is built whenever a package.json is present, with or without this.'
         required: false
         type: boolean
         default: false
       frozen_lockfile:
-        description: 'Use pnpm --frozen-lockfile (ignored when is_tool is false)'
+        description: 'Use pnpm --frozen-lockfile (ignored when the plugin has no package.json)'
         required: false
         type: boolean
         default: true
     secrets:
       OPENC3_API_TOKEN:
         required: true
+      RUBYGEMS_API_KEY:
+        description: 'RubyGems API key, only needed when deploy_to_rubygems is true'
+        required: false
 
 jobs:
   release:
@@ -53,6 +61,21 @@ jobs:
             exit 1
           fi
 
+      # Checked up front rather than at the push step, which runs after the tag
+      # has been pushed and the App Store upload has already happened
+      - name: Validate RubyGems credentials
+        if: ${{ inputs.deploy_to_rubygems }}
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: |
+          if [ -z "$GEM_HOST_API_KEY" ]; then
+            echo "Error: deploy_to_rubygems is true but the RUBYGEMS_API_KEY secret is empty"
+            echo "Add the key to the repo secrets and pass it through, e.g."
+            echo "  secrets:"
+            echo '    RUBYGEMS_API_KEY: $''{{ secrets.RUBYGEMS_API_KEY }}'
+            exit 1
+          fi
+
       - name: Validate package.json exists
         if: ${{ inputs.is_tool }}
         run: |
@@ -62,8 +85,25 @@ jobs:
             exit 1
           fi
 
+      # The presence of a package.json - not an input - is what decides whether
+      # the frontend gets built. Gating that on is_tool meant a plugin that grew
+      # a tool or a widget and whose caller never added the flag published a gem
+      # with the frontend silently missing. is_tool is now only the assertion
+      # above: say it when you want a missing package.json to fail the release.
+      - name: Detect frontend
+        id: frontend
+        working-directory: ${{ inputs.plugin_directory }}
+        run: |
+          if [ -f package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "Frontend detected, building with pnpm"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No package.json, nothing to build"
+          fi
+
       - name: Validate packageManager field
-        if: ${{ inputs.is_tool }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         run: |
           cat "${{ inputs.plugin_directory }}/package.json"
           if ! grep -q '"packageManager"' "${{ inputs.plugin_directory }}/package.json"; then
@@ -77,32 +117,36 @@ jobs:
         id: plugin_info
         working-directory: ${{ inputs.plugin_directory }}
         run: |
-          GEMSPEC_FILE=$(ls *.gemspec | head -n1)
-          if [ -z "$GEMSPEC_FILE" ]; then
+          shopt -s nullglob
+          GEMSPEC_FILES=(./*.gemspec)
+          GEMSPEC_FILE=$(basename "${GEMSPEC_FILES[0]:-}")
+          if [ ${#GEMSPEC_FILES[@]} -eq 0 ]; then
             echo "Error: No gemspec file found in ${{ inputs.plugin_directory }}"
             exit 1
           fi
           PLUGIN_NAME="${GEMSPEC_FILE%.gemspec}"
-          echo "plugin_name=$PLUGIN_NAME" >> $GITHUB_OUTPUT
+          echo "plugin_name=$PLUGIN_NAME" >> "$GITHUB_OUTPUT"
           echo "Plugin name: $PLUGIN_NAME"
 
       - name: Set up Node.js
-        if: ${{ inputs.is_tool }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         uses: actions/setup-node@v6
         with:
           node-version: '24'
 
       - name: Install pnpm
-        if: ${{ inputs.is_tool }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 #v5.0.0
+        with:
+          package_json_file: ${{ inputs.plugin_directory }}/package.json
 
       - name: Install frontend dependencies
-        if: ${{ inputs.is_tool }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         working-directory: ${{ inputs.plugin_directory }}
         run: pnpm install ${{ inputs.frozen_lockfile && '--frozen-lockfile' || '' }}
 
       - name: Build frontend
-        if: ${{ inputs.is_tool }}
+        if: ${{ steps.frontend.outputs.present == 'true' }}
         working-directory: ${{ inputs.plugin_directory }}
         run: pnpm run build
 
@@ -113,22 +157,36 @@ jobs:
 
       - name: Build gem
         working-directory: ${{ inputs.plugin_directory }}
-        run: rake build VERSION=${{ inputs.version }}
+        run: |
+          # Some plugins have a built gem committed at the plugin root. Clear any
+          # out first so the glob below can only match what this build produced;
+          # otherwise a stale gem sorts first and gets published in place of the
+          # version being released. Only the plugin root is touched, so gems
+          # vendored in subdirectories are left alone.
+          rm -f ./*.gem
+          rake build VERSION=${{ inputs.version }}
 
       - name: Find and set gem filename
         id: gem_file
         working-directory: ${{ inputs.plugin_directory }}
         run: |
-          GEM_FILE=$(ls ${{ steps.plugin_info.outputs.plugin_name }}-*.gem)
-          echo "gem_filename=$GEM_FILE" >> $GITHUB_OUTPUT
+          shopt -s nullglob
+          GEM_FILES=(./${{ steps.plugin_info.outputs.plugin_name }}-*.gem)
+          if [ ${#GEM_FILES[@]} -ne 1 ]; then
+            echo "Error: Expected exactly one gem after the build, found ${#GEM_FILES[@]}"
+            ls -la ./*.gem || true
+            exit 1
+          fi
+          GEM_FILE=$(basename "${GEM_FILES[0]}")
+          echo "gem_filename=$GEM_FILE" >> "$GITHUB_OUTPUT"
           echo "Found gem file: $GEM_FILE"
 
       - name: Calculate checksum
         id: checksum
         working-directory: ${{ inputs.plugin_directory }}
         run: |
-          CHECKSUM=$(shasum -a 256 ${{ steps.gem_file.outputs.gem_filename }} | cut -d' ' -f1)
-          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+          CHECKSUM=$(shasum -a 256 "${{ steps.gem_file.outputs.gem_filename }}" | cut -d' ' -f1)
+          echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
           echo "Checksum: $CHECKSUM"
 
       - name: Create and push git tag
@@ -142,7 +200,7 @@ jobs:
           fi
           git tag -a "$TAG_NAME" -m "Release ${{ steps.plugin_info.outputs.plugin_name }} version ${{ inputs.version }}"
           git push origin "$TAG_NAME"
-          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
         id: tag_info
 
       - name: Upload to OpenC3 App Store
@@ -168,6 +226,17 @@ jobs:
           fi
 
           echo "Plugin version ${{ inputs.version }} successfully uploaded to OpenC3 App Store!"
+
+      # gem push reads the credential from GEM_HOST_API_KEY, so nothing is
+      # written to ~/.gem/credentials on the runner
+      - name: Publish to RubyGems
+        if: ${{ inputs.deploy_to_rubygems }}
+        working-directory: ${{ inputs.plugin_directory }}
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: |
+          gem push "${{ steps.gem_file.outputs.gem_filename }}"
+          echo "Plugin version ${{ inputs.version }} successfully pushed to RubyGems!"
 
       - name: Create GitHub Release
         id: create_release

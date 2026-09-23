@@ -1,0 +1,285 @@
+# Builds a COSMOS plugin and installs it into a real COSMOS with Playwright.
+#
+# Starts the most recent COSMOS Core release in Docker using the cosmos-project
+# compose stack, builds the plugin gem from the calling repo, then drives the
+# Admin tool the way an operator would: Install From File, submit the variables
+# dialog, and wait for the install process to report Complete. This catches the
+# failures unit tests can't - a plugin.txt that doesn't parse, a target that
+# doesn't build, a microservice that won't start.
+#
+# Plugins that register a COSMOS tool additionally get each tool page opened and
+# checked for browser console errors. That is discovered from the COSMOS API
+# after install, so plugins without a tool skip it with nothing to configure.
+#
+# The Playwright harness lives in this repo under playwright-plugin/, so the
+# calling plugin needs no test files of its own.
+#
+# A frontend needs nothing declared either: a plugin with a package.json gets
+# pnpm and `pnpm install`, and `rake build` is what runs `pnpm run build`.
+#
+# Third party actions are pinned to a full commit SHA, because a tag can be moved
+# to point at different code. The comment after each pin records the tag it was.
+
+name: Plugin Playwright (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      plugin_directory:
+        description: 'Directory containing the plugin (e.g., openc3-cosmos-demo-plugin)'
+        required: false
+        type: string
+        default: '.'
+      version:
+        description: 'Version to build the plugin gem with'
+        required: false
+        type: string
+        default: '1.0.0'
+      cosmos_version:
+        description: 'COSMOS version to run, or latest to resolve the newest release'
+        required: false
+        type: string
+        default: 'latest'
+      expected_targets:
+        description: 'Space separated target names the plugin should define, checked after install'
+        required: false
+        type: string
+        default: ''
+      install_demo:
+        description: 'Install the COSMOS demo, which plugins that reference INST targets need'
+        required: false
+        type: boolean
+        default: false
+      is_tool:
+        description: 'Whether the plugin is expected to register a COSMOS tool, which makes registering none a failure rather than a skip'
+        required: false
+        type: boolean
+        default: false
+      console_ignore:
+        description: 'Newline separated regexes for browser console errors to allow on the tool pages'
+        required: false
+        type: string
+        default: ''
+      ruby_version:
+        description: 'Ruby version used to build the gem'
+        required: false
+        type: string
+        default: '3.4'
+      workflows_ref:
+        description: 'Ref of OpenC3/.github to take the Playwright harness from'
+        required: false
+        type: string
+        default: 'main'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  playwright:
+    name: Install plugin in COSMOS
+    runs-on: ubuntu-latest
+    # Checkout, the gem build and starting COSMOS can take 20 minutes before
+    # Playwright starts, and Playwright's own globalTimeout is 40
+    timeout-minutes: 75
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The harness lives alongside this workflow rather than in every plugin
+      - name: Checkout Playwright harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OpenC3/.github
+          ref: ${{ inputs.workflows_ref }}
+          path: .openc3-shared
+
+      - name: Resolve COSMOS version
+        id: cosmos
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.cosmos_version }}
+        run: |
+          set -euo pipefail
+          if [ "$REQUESTED" = "latest" ]; then
+            # Release tags are v7.4.0, the image tag is 7.4.0
+            tag=$(gh api repos/OpenC3/cosmos/releases/latest --jq .tag_name)
+            version="${tag#v}"
+          else
+            version="${REQUESTED#v}"
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::Could not resolve a COSMOS version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Running COSMOS $version"
+          echo "COSMOS version: \`$version\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout cosmos-project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OpenC3/cosmos-project
+          path: .cosmos
+
+      - name: Configure the COSMOS stack
+        working-directory: .cosmos
+        env:
+          COSMOS_VERSION: ${{ steps.cosmos.outputs.version }}
+          INSTALL_DEMO: ${{ inputs.install_demo }}
+        run: |
+          set -euo pipefail
+          # .env ships the defaults; .env.local is loaded after it and wins, so
+          # the pinned upstream file stays untouched
+          # The empty string is the one value that disables the demo on every
+          # COSMOS. Current init.sh reads OPENC3_DEMO through flag_enabled, where
+          # empty, 0 and false are all off, but older releases tested it with
+          # `[ ! -z $OPENC3_DEMO ]`, where the non-empty string 0 counts as ON.
+          demo=
+          if [ "$INSTALL_DEMO" = "true" ]; then demo=1; fi
+          cat > .env.local <<EOF
+          OPENC3_TAG=$COSMOS_VERSION
+          OPENC3_DEMO=$demo
+          EOF
+          cat .env.local
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      # A plugin's Rakefile runs `pnpm run build` itself whenever the plugin has
+      # a package.json, so the presence of that file - not an input - is what
+      # decides whether the runner needs pnpm. Asking for the flag separately
+      # only created a way to get it wrong: a widget or tool plugin whose caller
+      # forgot to set it failed later, inside `rake build`, as pnpm not found.
+      - name: Detect frontend
+        id: frontend
+        working-directory: ${{ inputs.plugin_directory }}
+        run: |
+          set -euo pipefail
+          if [ -f package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "Frontend: \`package.json\` found, building with pnpm" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "Frontend: no \`package.json\`, nothing to build" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install pnpm
+        if: ${{ steps.frontend.outputs.present == 'true' }}
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+        with:
+          package_json_file: ${{ inputs.plugin_directory }}/package.json
+
+      - name: Install frontend dependencies
+        if: ${{ steps.frontend.outputs.present == 'true' }}
+        working-directory: ${{ inputs.plugin_directory }}
+        run: pnpm install --frozen-lockfile
+
+      # openc3cli is what `rake build` shells out to for validation
+      - name: Install openc3 gem
+        run: gem install --no-document openc3
+
+      # There is no separate `pnpm run build` step because this one covers it:
+      # the plugin's Rakefile runs the frontend build itself when the plugin has
+      # a package.json
+      - name: Build plugin gem
+        id: gem
+        working-directory: ${{ inputs.plugin_directory }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Some plugins have a built gem committed. Clear any out of the way so
+          # the gem we install is unambiguously the one we just built, and so a
+          # stale committed gem can't be what gets tested.
+          rm -f ./*.gem
+          rake build VERSION="$VERSION"
+          shopt -s nullglob
+          gems=(./*.gem)
+          if [ ${#gems[@]} -ne 1 ]; then
+            echo "::error::Expected exactly one gem after the build, found ${#gems[@]}"
+            ls -la ./*.gem || true
+            exit 1
+          fi
+          gem_path=$(cd "$(dirname "${gems[0]}")" && pwd)/$(basename "${gems[0]}")
+          echo "path=$gem_path" >> "$GITHUB_OUTPUT"
+          echo "Built \`$(basename "$gem_path")\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start COSMOS
+        working-directory: .cosmos
+        run: ./openc3.sh run
+
+      - name: Wait for COSMOS to come up
+        run: |
+          set -euo pipefail
+          # The Playwright setup project waits for the tools to register; this
+          # only waits for the front door, and fails fast on a crash loop
+          for attempt in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://localhost:2900; then
+              echo "COSMOS is answering after ${attempt} attempts"
+              exit 0
+            fi
+            if docker ps --format '{{.Names}} {{.Status}}' | grep -q Restarting; then
+              echo "::error::A COSMOS container is restarting"
+              docker ps
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "::error::COSMOS did not answer on http://localhost:2900"
+          docker ps
+          exit 1
+
+      - name: Install Playwright
+        working-directory: .openc3-shared/playwright-plugin
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Install the plugin with Playwright
+        working-directory: .openc3-shared/playwright-plugin
+        env:
+          CI: true
+          PLUGIN_GEM: ${{ steps.gem.outputs.path }}
+          EXPECTED_TARGETS: ${{ inputs.expected_targets }}
+          # Tool pages are only checked when the plugin registers a tool, which
+          # the spec discovers from the COSMOS API after install
+          IS_TOOL: ${{ inputs.is_tool }}
+          CONSOLE_IGNORE: ${{ inputs.console_ignore }}
+        run: npx playwright test --project=chromium
+
+      - name: COSMOS logs
+        if: ${{ failure() }}
+        working-directory: .cosmos
+        run: |
+          docker ps -a
+          for service in openc3-cosmos-init openc3-operator openc3-cosmos-cmd-tlm-api openc3-cosmos-script-runner-api; do
+            echo "::group::$service"
+            docker compose logs --tail 200 "$service" || true
+            echo "::endgroup::"
+          done
+
+      - name: Upload Playwright artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plugin-playwright
+          path: .openc3-shared/playwright-plugin/test-results
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Stop COSMOS
+        if: ${{ always() }}
+        working-directory: .cosmos
+        run: ./openc3.sh stop || true
