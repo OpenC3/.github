@@ -15,6 +15,10 @@
 // password field carries data-test=new-password either way, so key off whether
 // the confirm field is present rather than off the labels, which change text
 // between the two states.
+//
+// The data-test attributes sit on the v-text-field, which Vuetify renders as a
+// wrapper div around the real <input>. Playwright can only fill the input, so
+// fill() has to reach inside the wrapper.
 
 import { test as setup, expect, Page } from '@playwright/test'
 import { STORAGE_STATE } from '../playwright.config'
@@ -68,11 +72,11 @@ setup('sign in', async ({ page }) => {
   await expect(page.locator('[data-test=new-password]')).toBeVisible({
     timeout: 60 * 1000,
   })
-  await page.locator('[data-test=new-password]').fill(PASSWORD)
+  await page.locator('[data-test=new-password] input').fill(PASSWORD)
 
   if (await page.locator('[data-test=confirm-password]').isVisible()) {
     // First run, COSMOS wants the password created
-    await page.locator('[data-test=confirm-password]').fill(PASSWORD)
+    await page.locator('[data-test=confirm-password] input').fill(PASSWORD)
     await page.locator('[data-test=set-password]').click()
   } else {
     // A password already exists, e.g. re-running against a stack still up
