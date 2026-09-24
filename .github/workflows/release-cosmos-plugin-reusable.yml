@@ -211,8 +211,17 @@ jobs:
           else
             TAG_NAME="${{ steps.plugin_info.outputs.plugin_name }}/v${{ inputs.version }}"
           fi
-          git tag -a "$TAG_NAME" -m "Release ${{ steps.plugin_info.outputs.plugin_name }} version ${{ inputs.version }}"
-          git push origin "$TAG_NAME"
+
+          git fetch --tags
+
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Tag $TAG_NAME already exists, skipping tag creation"
+          else
+            git tag -a "$TAG_NAME" -m "Release ${{ steps.plugin_info.outputs.plugin_name }} version ${{ inputs.version }}"
+            git push origin "$TAG_NAME"
+            echo "Created and pushed tag $TAG_NAME"
+          fi
+
           echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
         id: tag_info
 
