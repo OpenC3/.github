@@ -234,6 +234,37 @@ EXECUTABLE_EXTS = (
     ".a",
     ".wasm",
 )
+# Real binary formats. Other files git calls binary (e.g. a script with one NUL byte) are scanned as text,
+# but decoding these as text would trip the invisible-character rules by chance.
+BINARY_MEDIA_EXTS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".ico",
+    ".webp",
+    ".tif",
+    ".tiff",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tgz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".eot",
+    ".mp3",
+    ".mp4",
+    ".wav",
+    ".ogg",
+    ".webm",
+    ".mov",
+)
 BLOB_EXEMPT_RE = re.compile(r"\.(svg|map|snap|pem|crt|lock)$|(^|/)(pnpm-lock\.yaml|package-lock\.json)$")
 # Build output and vendored minified code: huge, machine-written, and full of patterns that are
 # normal there (zero-width anchors, base64 fonts, mixed scripts). Only rules that never fire
@@ -401,7 +432,8 @@ def parse_added_lines(diff: str) -> dict[str, list[tuple[int, str]]]:
                 old_left = new_left = 0
             continue
         if raw.startswith("+++ "):
-            target = unquote_path(raw[4:])
+            # git appends a tab to the header when the path contains a space
+            target = unquote_path(raw[4:].removesuffix("\t"))
             path = None if target == "/dev/null" else target[2:] if target.startswith("b/") else target
             if path is not None:
                 files.setdefault(path, [])
@@ -417,6 +449,7 @@ def parse_added_lines(diff: str) -> dict[str, list[tuple[int, str]]]:
 def deterministic_scan(base: str, head: str) -> tuple[list[Finding], str]:
     """Rules over the code and commit messages; the PR title and body are metadata_scan's."""
     findings: list[Finding] = []
+    media: list[str] = []
     diff_args = ["--no-color", "--no-ext-diff", "--no-textconv", "-M", f"{base}...{head}"]
 
     # File-level checks
@@ -443,6 +476,8 @@ def deterministic_scan(base: str, head: str) -> tuple[list[Finding], str]:
                 findings.append(Finding("block", "executable-file", path, 0, "adds or changes a compiled executable"))
             elif added == "-":
                 findings.append(Finding("warn", "binary-file", path, 0, "adds or changes a binary file"))
+                if path.lower().endswith(BINARY_MEDIA_EXTS):
+                    media.append(f":(exclude,literal){path}")
     for line in git("diff", "--summary", *diff_args).splitlines():
         if "mode 120000" in line:
             findings.append(Finding("warn", "symlink", line.split()[-1], 0, "adds a symlink"))
@@ -460,8 +495,9 @@ def deterministic_scan(base: str, head: str) -> tuple[list[Finding], str]:
             )
         )
 
-    # Line-level checks
-    diff = git("diff", "--unified=0", *diff_args)
+    # Line-level checks. --text: otherwise one NUL byte turns a file's contents into "Binary files differ".
+    text_args = ["--text", *diff_args, "--", ".", *media]
+    diff = git("diff", "--unified=0", *text_args)
     for path, lines in parse_added_lines(diff).items():
         is_lock = bool(LOCKFILE_RE.search(path))
         for line_no, text in lines:
@@ -480,7 +516,7 @@ def deterministic_scan(base: str, head: str) -> tuple[list[Finding], str]:
         scan_text("(commit messages)", i, text, findings, code_rules=False)
 
     excludes = [":(exclude)*.lock", ":(exclude)**/pnpm-lock.yaml", ":(exclude)docs/**", ":(exclude)**/*.min.*"]
-    full_diff = git("diff", "--unified=5", *diff_args, "--", ".", *excludes)
+    full_diff = git("diff", "--unified=5", *text_args, *excludes)
     return dedupe(findings), full_diff
 
 

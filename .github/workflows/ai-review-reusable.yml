@@ -304,8 +304,9 @@ jobs:
           note() { printf '\n> [!WARNING]\n> %s\n' "$1" >> "$COMMENT_FILE"; }
           # The agents could read secrets on the runner; never publish a commit that contains one.
           # No grep -q: exiting early would SIGPIPE git log, and pipefail would read that as no match.
+          # --text: a NUL byte or a -diff attribute would otherwise hide a file's contents from the grep.
           patterns="$(printf '%s\n' "$PUSH_TOKEN" "$ANTHROPIC_KEY" "$OPENAI_KEY" "$GITHUB_TOKEN_VALUE" | grep -v '^$' || true)"
-          if git log -p --no-ext-diff --no-textconv --format=%B "${HEAD_SHA}..HEAD" | grep -F -f <(echo "$patterns") > /dev/null; then
+          if git log -p --text --no-ext-diff --no-textconv --format=%B "${HEAD_SHA}..HEAD" | grep -F -f <(echo "$patterns") > /dev/null; then
             note "The fix commits contained a secret and were not pushed. Rotate the repository's API keys and tokens."
             echo "::error::The fix commits contain a secret; not pushing"
             exit 1

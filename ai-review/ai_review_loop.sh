@@ -278,7 +278,8 @@ while (( turn < MAX_TURNS )); do
   if (( rc == 0 )); then
     git add -A
     # An agent that wrote a key into the tree or its result must not get it committed or posted
-    if { git diff --cached "$before_sha" && cat "$result_file"; } | leaks_secret; then
+    # --text: a NUL byte or a -diff attribute would otherwise print "Binary files differ" instead of the key
+    if { git diff --cached --text --no-ext-diff --no-textconv "$before_sha" && cat "$result_file"; } | leaks_secret; then
       discard="it contained an API key"
     else
       changed="$(git diff --cached --name-only --no-renames "$before_sha")"
