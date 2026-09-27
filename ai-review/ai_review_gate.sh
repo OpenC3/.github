@@ -88,8 +88,13 @@ if [[ "$scan_state" == "success" ]]; then
     scan_run_info="$(gh api "repos/$repo/actions/runs/$scan_run" --jq '[.event, .name, .conclusion // ""] | @tsv' || true)"
   fi
   IFS=$'\t' read -r run_event run_name run_conclusion <<< "$scan_run_info"
+  # The scan dispatches this review before its own run finishes, so only that dispatch may accept a
+  # run with no conclusion yet. Otherwise a status forged while the real scan is still running, and
+  # pointed at that run, would start the review on a commit the scan may still block.
+  allowed_conclusion="^success$"
+  [[ "$EVENT_NAME" == "workflow_dispatch" ]] && allowed_conclusion="^(success)?$"
   if [[ "$run_event" != "pull_request_target" || "$run_name" != "$SCAN_WORKFLOW" ||
-    ! "$run_conclusion" =~ ^(success)?$ ]]; then
+    ! "$run_conclusion" =~ $allowed_conclusion ]]; then
     skip "the malicious code scan status on $HEAD_SHA was not posted by a passing $SCAN_WORKFLOW run"
   fi
 fi

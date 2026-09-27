@@ -56,8 +56,9 @@ def on_block(text: str) -> str:
 
 def runs_on_pull_request(text: str) -> bool:
     block = on_block(text)
-    # `on: pull_request`, `on: [push, pull_request]`, or a `pull_request:` key; not pull_request_target
-    return bool(re.search(r"^\s*(\[[^]]*)?\bpull_request\b(?!_)", block, re.M))
+    # `on: pull_request`, `on: [push, pull_request]`, a `- pull_request` list item, or a `pull_request:` key;
+    # not pull_request_target
+    return bool(re.search(r"^\s*(\[[^]]*|-\s*)?\bpull_request\b(?!_)", block, re.M))
 
 
 def listed_workflows(text: str) -> set[str]:

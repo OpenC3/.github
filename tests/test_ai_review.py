@@ -380,6 +380,15 @@ class ReviewTests(unittest.TestCase):
                 self.assertFalse((repository / path).exists())
                 self.assertIn("configure the AI agents", (self.directory / "out/comment.md").read_text())
 
+    def test_turn_that_hides_agent_config_behind_gitignore_is_discarded(self):
+        outputs, _, repository, new_commits = self.run_loop(
+            claude_action="echo planted > AGENTS.md && echo AGENTS.md >> .gitignore"
+        )
+        self.assertEqual(outputs["status"], "error")
+        self.assertEqual(new_commits, "0")
+        self.assertFalse((repository / "AGENTS.md").exists())
+        self.assertIn("configure the AI agents", (self.directory / "out/comment.md").read_text())
+
     def test_key_hidden_as_binary_is_not_committed(self):
         for action in (
             'printf "\\0%s\\n" "$ANTHROPIC_API_KEY" > leak.txt',
@@ -550,12 +559,13 @@ class ReviewTests(unittest.TestCase):
                 "tests.yml": "name: Unit Tests  # main build\non:\n  pull_request:\n    branches: [main]\n",
                 "lint.yml": "name: 'Lint'\non: [push, pull_request]\n",
                 "short.yml": "name: Short\non: pull_request\n",
+                "listed.yml": "name: Listed\non:\n  - push\n  - pull_request\n",
                 "scan.yml": "name: Malicious Code Scan\non:\n  pull_request_target:\n",
                 "release.yml": "name: Release\non:\n  push:\n    branches: [main]\n",
             }
         )
         warned = set(re.findall(r"^::warning [^:]*::'([^']+)'", output, re.M))
-        self.assertEqual(warned, {"Lint", "Short", "Gone"})
+        self.assertEqual(warned, {"Lint", "Short", "Listed", "Gone"})
         self.assertIn("'Gone' is listed but no workflow", output)
 
     def test_trigger_check_accepts_a_complete_list(self):
@@ -731,6 +741,26 @@ class ReviewTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.outputs()["skip"], "true")
                 self.assertIn("not posted by a passing", self.outputs()["reason"])
+
+    def test_gate_only_accepts_an_unfinished_scan_run_from_its_dispatch(self):
+        # The scan dispatches the review before its own run concludes; a status forged while the
+        # scan is still running and pointed at that run must not start a CI-triggered review
+        self.fixtures["repos/owner/repo/actions/runs/80"] = {
+            "event": "pull_request_target",
+            "name": "Malicious Code Scan",
+            "conclusion": None,
+        }
+        self.fixtures["repos/owner/repo/commits/test-head/status"]["statuses"][0]["target_url"] = SCAN_RUN_URL.format(
+            80
+        )
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "true")
+        self.assertIn("not posted by a passing", self.outputs()["reason"])
+        self.outputs_path.unlink()
+        result = self.run_shell(f'bash "{GATE}"', {"EVENT_NAME": "workflow_dispatch"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "false")
 
     def test_forged_scan_statuses_are_not_trusted(self):
         # A PR's own workflow posts a failure (to enable an override) and an override success

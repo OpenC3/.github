@@ -115,6 +115,19 @@ git_unchanged() {
   diff -r --no-dereference "$GIT_SNAPSHOT" "$OUT_DIR/git-current" > /dev/null 2>&1
 }
 
+# git add -A skips ignored files, so an agent could plant agent config (or add it to .gitignore)
+# where the staged-change check never sees it and git clean leaves it for the next agent. Lists the
+# ignored files matching AGENT_CONFIG_RE with a hash of each, so a turn that adds or edits one shows.
+ignored_agent_config() {
+  local path
+  git -c core.quotePath=false ls-files -o -i --exclude-standard -z | while IFS= read -r -d '' path; do
+    # A here-string keeps a newline inside a name from hiding it, as for the staged paths below
+    if grep -Eq "$AGENT_CONFIG_RE" <<< "$path"; then
+      printf '%s %s\n' "$(git hash-object --no-filters -- "$path" 2> /dev/null || echo unreadable)" "$path"
+    fi
+  done
+}
+
 # Succeeds if stdin contains an API key. Agents can read files on the runner, so anything they
 # write is checked before it is committed or posted. This only catches exact copies; an encoded
 # key gets through, so the malicious code scan that gates this review remains the real defense.
@@ -255,6 +268,7 @@ while (( turn < MAX_TURNS )); do
 
   echo "::group::Turn $turn: $reviewer"
   before_sha="$(git rev-parse HEAD)"
+  ignored_before="$(ignored_agent_config)"
   if [[ "$reviewer" == "Claude" ]]; then
     run_claude "$prompt_file" "$result_file" "$turn" && rc=0 || rc=$?
   else
@@ -285,7 +299,7 @@ while (( turn < MAX_TURNS )); do
       # Unquoted: git otherwise wraps non-ASCII paths in quotes, which the ^ anchors would miss.
       # -z and tr keep a newline inside a name from hiding it (each piece starts a line).
       changed="$(git -c core.quotePath=false diff --cached --name-only --no-renames -z "$before_sha" | tr '\0' '\n')"
-      if grep -Eq "$AGENT_CONFIG_RE" <<< "$changed"; then
+      if grep -Eq "$AGENT_CONFIG_RE" <<< "$changed" || [[ "$(ignored_agent_config)" != "$ignored_before" ]]; then
         discard="it changed files that configure the AI agents or this review"
       elif grep -Eq "$CI_CONFIG_RE" <<< "$changed"; then
         discard="it changed CI workflows or actions"
@@ -305,7 +319,8 @@ while (( turn < MAX_TURNS )); do
     rm -f "$result_file"
     # Keep whatever the agent left half-done out of the branch
     git reset --hard "$before_sha" > /dev/null
-    git clean -fdq
+    # -x: ignored files too, so agent config hidden behind .gitignore goes as well
+    git clean -fdqx
     status="error"
     break
   fi
