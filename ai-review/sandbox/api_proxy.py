@@ -20,7 +20,8 @@ Environment:
   PROXY_UPSTREAM   - base URL to forward to, e.g. https://api.anthropic.com
   PROXY_AUTH       - x-api-key (Anthropic) or bearer (OpenAI)
   PROXY_API_KEY    - the key to add
-  PROXY_ROUTES     - regex matched against "<METHOD> <path>" (query string excluded)
+  PROXY_ROUTES     - regex matched against "<METHOD> <path>" (query string excluded). Only the
+                     matched path and query are forwarded; ambiguous targets are refused.
   PROXY_PORT       - port to listen on (default 8080)
 
 Standard library only.
@@ -61,6 +62,22 @@ DROP_HEADERS = {
 }
 
 
+def request_target(raw: str) -> tuple[str, str] | None:
+    """Return (path, path plus query) to match and forward, or None if the target is ambiguous.
+
+    The upstream may decode or normalize the path, so anything that could change under that
+    (percent-encoding, dot segments, doubled slashes, backslashes) is refused rather than forwarded.
+    """
+    parts = urllib.parse.urlsplit(raw)
+    if "#" in raw or parts.scheme or parts.netloc or not parts.path.startswith("/"):
+        return None
+    if any(c in parts.path for c in "%\\") or "//" in parts.path:
+        return None
+    if any(segment in (".", "..") for segment in parts.path.split("/")):
+        return None
+    return parts.path, parts.path + (f"?{parts.query}" if parts.query else "")
+
+
 class Proxy(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -80,11 +97,12 @@ class Proxy(BaseHTTPRequestHandler):
 
     def forward(self) -> None:
         self.close_connection = True
-        path = urllib.parse.urlsplit(self.path).path
-        if not ROUTES.fullmatch(f"{self.command} {path}"):
-            self.log_message("refused %s %s", self.command, path)
+        target = request_target(self.path)
+        if not target or not ROUTES.fullmatch(f"{self.command} {target[0]}"):
+            self.log_message("refused %s %r", self.command, self.path)
             self.send_error(403, "route not allowed by the AI review proxy")
             return
+        forwarded = target[1]
         body = self.read_body()
         headers = {k: v for k, v in self.headers.items() if k.lower() not in DROP_HEADERS}
         if AUTH == "x-api-key":
@@ -96,7 +114,7 @@ class Proxy(BaseHTTPRequestHandler):
         upstream = connection_class(UPSTREAM.netloc, timeout=600)
         started = False
         try:
-            upstream.request(self.command, UPSTREAM.path.rstrip("/") + self.path, body=body, headers=headers)
+            upstream.request(self.command, UPSTREAM.path.rstrip("/") + forwarded, body=body, headers=headers)
             response = upstream.getresponse()
             self.send_response(response.status, response.reason)
             for key, value in response.getheaders():

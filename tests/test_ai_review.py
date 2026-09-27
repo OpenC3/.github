@@ -706,7 +706,20 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(headers["x-api-key"], CLAUDE_KEY)
         self.assertNotIn("Authorization", headers)
         self.assertEqual(sent, b'{"model": "m"}')
-        for method, path in (("POST", "/v1/files"), ("DELETE", "/v1/messages"), ("POST", "/v1/messages/../files")):
+        refused = (
+            ("POST", "/v1/files"),
+            ("DELETE", "/v1/messages"),
+            ("POST", "/v1/messages/../files"),
+            ("POST", "/v1/messages#/../../v1/files"),
+            ("POST", "/v1/messages?x#/../../v1/files"),
+            ("POST", "/v1/messages/%2e%2e/files"),
+            ("POST", "/v1/messages%2F..%2Ffiles"),
+            ("POST", "/v1//messages"),
+            ("POST", "/v1/./messages"),
+            ("POST", "/v1\\messages"),
+            ("POST", "http://127.0.0.1/v1/messages"),
+        )
+        for method, path in refused:
             with self.subTest(method=method, path=path):
                 self.assertEqual(request(method, path)[0], 403)
         self.assertEqual(len(received), 1)
