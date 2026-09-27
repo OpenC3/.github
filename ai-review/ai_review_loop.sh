@@ -87,7 +87,7 @@ fresh_agent_home() {
 # Files that steer the agents or this review, in the reviewed repository or in OpenC3/.github
 # itself; keep in sync with PROTECTED_PATHS in malicious_code_scan.py (tests/test_ai_review.py
 # checks). A turn that changes one is discarded: the next agent would load it.
-AGENT_CONFIG_RE='(^|/)(CLAUDE\.md|AGENTS\.md|\.mcp\.json)$|(^|/)\.(claude|codex|cursor)/'
+AGENT_CONFIG_RE='(^|/)(CLAUDE(\.local)?\.md|AGENTS(\.override)?\.md|\.mcp\.json)$|(^|/)\.(claude|codex|cursor)/'
 AGENT_CONFIG_RE+='|^\.github/copilot-instructions\.md$|^(ai-review|malicious-code-scan)/'
 AGENT_CONFIG_RE+='|^\.github/workflows/(ai[-_]review|malicious[-_]code[-_]scan)(-reusable)?\.ya?ml$'
 # Workflows and actions run with secrets on the next CI run, and pushing them needs a token with
@@ -366,8 +366,14 @@ commits=0
   echo "Reviewed commit: \`$START_SHA\`"
   echo
   # Concerns from each reviewer's most recent successful turn need a human decision
-  concerns="$(for ((t = turn; t >= 1 && t > turn - 2; t--)); do
-    jq -r '.unresolved_concerns[]? | "- \(.)"' "$OUT_DIR/result-$t.json" 2> /dev/null || true
+  # (reviewers alternate turns; a failed or discarded turn has no result file)
+  concerns="$(for start in "$turn" "$((turn - 1))"; do
+    for ((t = start; t >= 1; t -= 2)); do
+      if [[ -f "$OUT_DIR/result-$t.json" ]]; then
+        jq -r '.unresolved_concerns[]? | "- \(.)"' "$OUT_DIR/result-$t.json" 2> /dev/null || true
+        break
+      fi
+    done
   done | sort -u)"
   if [[ -n "$concerns" ]]; then
     echo "### Open concerns for a human"

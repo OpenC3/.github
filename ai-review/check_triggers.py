@@ -32,10 +32,21 @@ from pathlib import Path
 BUILTIN = {"CodeQL"}
 
 
+def scalar(value: str) -> str:
+    """A YAML scalar without quotes or a trailing comment; a quoted value may contain " #"."""
+    value = value.strip()
+    if value[:1] in ("'", '"'):
+        end = value.find(value[0], 1)
+        if end > 0:
+            return value[1:end]
+    return re.split(r"\s#", value, maxsplit=1)[0].strip()
+
+
 def workflow_name(text: str, path: Path) -> str:
-    match = re.search(r"^name:\s*['\"]?(.+?)['\"]?\s*$", text, re.M)
+    match = re.search(r"^name:(.*)$", text, re.M)
+    name = scalar(match.group(1)) if match else ""
     # GitHub names an unnamed workflow after its path
-    return match.group(1) if match else f".github/workflows/{path.name}"
+    return name or f".github/workflows/{path.name}"
 
 
 def on_block(text: str) -> str:
@@ -66,7 +77,7 @@ def listed_workflows(text: str) -> set[str]:
                 if not dash:
                     break
                 items.append(dash.group(1))
-        return {item.split(" #", 1)[0].strip().strip("'\"") for item in items if item.strip()}
+        return {scalar(item) for item in items if scalar(item)}
     return set()
 
 

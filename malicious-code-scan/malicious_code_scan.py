@@ -193,8 +193,8 @@ PRIVATE_IP = re.compile(r"^(127\.|10\.|0\.0\.0\.0|169\.254\.|192\.168\.|172\.(1[
 # Files that steer the AI agents or this scanner, in the scanned repository or in OpenC3/.github
 # itself; a change needs a human. Keep in sync with AGENT_CONFIG_RE in ai_review_loop.sh.
 PROTECTED_PATHS = [
-    r"(^|/)CLAUDE\.md$",
-    r"(^|/)AGENTS\.md$",
+    r"(^|/)CLAUDE(\.local)?\.md$",
+    r"(^|/)AGENTS(\.override)?\.md$",
     r"(^|/)\.claude/",
     r"(^|/)\.codex/",
     r"(^|/)\.cursor/",
@@ -268,8 +268,29 @@ BINARY_MEDIA_EXTS = (
 BLOB_EXEMPT_RE = re.compile(r"\.(svg|map|snap|pem|crt|lock)$|(^|/)(pnpm-lock\.yaml|package-lock\.json)$")
 # Build output and vendored minified code: huge, machine-written, and full of patterns that are
 # normal there (zero-width anchors, base64 fonts, mixed scripts). Only rules that never fire
-# legitimately run on them, and they are left out of the Claude review.
-GENERATED_RE = re.compile(r"^docs/|\.min\.(js|css|mjs)$|\.(js|css)\.map$")
+# legitimately run on them, and they are left out of the Claude review. Under docs/ only built
+# site assets count: scripts and top-level config files there (conf.py, docusaurus.config.js) run
+# in CI and get every rule. GENERATED_EXCLUDES must match the same paths (tests check).
+GENERATED_RE = re.compile(
+    r"\.min\.(js|css|mjs)$|\.(js|css)\.map$|^docs/(.+/)?[^/]+\.(html|css|map|xml|txt)$|^docs/.+/[^/]+\.js$"
+)
+# git pathspecs without glob magic, where * also matches /
+GENERATED_EXCLUDES = [
+    f":(exclude){pattern}"
+    for pattern in (
+        "*.min.js",
+        "*.min.css",
+        "*.min.mjs",
+        "*.js.map",
+        "*.css.map",
+        "docs/*.html",
+        "docs/*.css",
+        "docs/*.map",
+        "docs/*.xml",
+        "docs/*.txt",
+        "docs/*/*.js",
+    )
+]
 GENERATED_RULES = {
     "bidi-control",
     "unicode-tag",
@@ -515,7 +536,7 @@ def deterministic_scan(base: str, head: str) -> tuple[list[Finding], str]:
     for i, text in enumerate(git("log", "--format=%B", f"{base}..{head}").splitlines(), 1):
         scan_text("(commit messages)", i, text, findings, code_rules=False)
 
-    excludes = [":(exclude)*.lock", ":(exclude)**/pnpm-lock.yaml", ":(exclude)docs/**", ":(exclude)**/*.min.*"]
+    excludes = [":(exclude)*.lock", ":(exclude)**/pnpm-lock.yaml", *GENERATED_EXCLUDES]
     full_diff = git("diff", "--unified=5", *text_args, *excludes)
     return dedupe(findings), full_diff
 

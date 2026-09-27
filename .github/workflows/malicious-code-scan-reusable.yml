@@ -185,8 +185,11 @@ jobs:
             echo "stale=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          PR_TITLE="$(jq -r '.title' <<< "$pr")"
-          PR_BODY="$(jq -r '.body // ""' <<< "$pr")"
+          # jq -j and the x sentinel keep trailing newlines, which the event text also keeps
+          PR_TITLE="$(jq -j '.title' <<< "$pr"; printf x)"
+          PR_TITLE="${PR_TITLE%x}"
+          PR_BODY="$(jq -j '.body // ""' <<< "$pr"; printf x)"
+          PR_BODY="${PR_BODY%x}"
           export PR_TITLE PR_BODY
           if [[ "$PR_TITLE" != "$EVENT_PR_TITLE" || "$PR_BODY" != "$EVENT_PR_BODY" ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
