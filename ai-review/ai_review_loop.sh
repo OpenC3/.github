@@ -282,7 +282,9 @@ while (( turn < MAX_TURNS )); do
     if { git diff --cached --text --no-ext-diff --no-textconv "$before_sha" && cat "$result_file"; } | leaks_secret; then
       discard="it contained an API key"
     else
-      changed="$(git diff --cached --name-only --no-renames "$before_sha")"
+      # Unquoted: git otherwise wraps non-ASCII paths in quotes, which the ^ anchors would miss.
+      # -z and tr keep a newline inside a name from hiding it (each piece starts a line).
+      changed="$(git -c core.quotePath=false diff --cached --name-only --no-renames -z "$before_sha" | tr '\0' '\n')"
       if grep -Eq "$AGENT_CONFIG_RE" <<< "$changed"; then
         discard="it changed files that configure the AI agents or this review"
       elif grep -Eq "$CI_CONFIG_RE" <<< "$changed"; then

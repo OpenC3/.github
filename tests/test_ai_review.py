@@ -345,7 +345,11 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("### Open concerns for a human\n\n- needs a human decision", comment)
 
     def test_turn_that_changes_ci_config_is_discarded(self):
-        for path in (".github/workflows/python_lint.yml", ".github/actions/setup/action.yml"):
+        for path in (
+            ".github/workflows/python_lint.yml",
+            ".github/actions/setup/action.yml",
+            ".github/workflows/café.yml",
+        ):
             with self.subTest(path=path):
                 self.setUp()
                 action = f'mkdir -p "$(dirname {path})" && echo "on: push" > {path}'
@@ -363,6 +367,8 @@ class ReviewTests(unittest.TestCase):
             "sub/AGENTS.md",
             "AGENTS.override.md",
             "ai-review/prompt.md",
+            "ai-review/café.md",
+            "sub/CLAUDÉ/CLAUDE.md",
         ):
             with self.subTest(path=path):
                 self.setUp()
@@ -601,6 +607,7 @@ class ReviewTests(unittest.TestCase):
         paths = {
             "docs/index.html": True,
             "docs/assets/js/main.3f2a.js": True,
+            "docs/build/assets/js/runtime.9c1d.js": True,
             "docs/assets/css/styles.css": True,
             "docs/sitemap.xml": True,
             "docs/assets/js/main.js.map": True,
@@ -609,6 +616,10 @@ class ReviewTests(unittest.TestCase):
             "docs/conf.py": False,
             "docs/docusaurus.config.js": False,
             "docs/scripts/build.sh": False,
+            "docs/scripts/build.js": False,
+            "docs/src/theme/Root.js": False,
+            "docs/js/custom.js": False,
+            "docs/fooassets/x.js": False,
             "docs/src/theme/index.ts": False,
             "docs/README.md": False,
             "src/app.js": False,

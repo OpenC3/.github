@@ -269,10 +269,11 @@ BLOB_EXEMPT_RE = re.compile(r"\.(svg|map|snap|pem|crt|lock)$|(^|/)(pnpm-lock\.ya
 # Build output and vendored minified code: huge, machine-written, and full of patterns that are
 # normal there (zero-width anchors, base64 fonts, mixed scripts). Only rules that never fire
 # legitimately run on them, and they are left out of the Claude review. Under docs/ only built
-# site assets count: scripts and top-level config files there (conf.py, docusaurus.config.js) run
-# in CI and get every rule. GENERATED_EXCLUDES must match the same paths (tests check).
+# site assets count, and JavaScript only inside an assets/ directory: scripts and config files
+# there (conf.py, docusaurus.config.js, scripts/build.js, src/theme/Root.js) run in CI and get
+# every rule. GENERATED_EXCLUDES must match the same paths (tests check).
 GENERATED_RE = re.compile(
-    r"\.min\.(js|css|mjs)$|\.(js|css)\.map$|^docs/(.+/)?[^/]+\.(html|css|map|xml|txt)$|^docs/.+/[^/]+\.js$"
+    r"\.min\.(js|css|mjs)$|\.(js|css)\.map$|^docs/(.+/)?[^/]+\.(html|css|map|xml|txt)$|^docs/(.+/)?assets/.+\.js$"
 )
 # git pathspecs without glob magic, where * also matches /
 GENERATED_EXCLUDES = [
@@ -288,7 +289,8 @@ GENERATED_EXCLUDES = [
         "docs/*.map",
         "docs/*.xml",
         "docs/*.txt",
-        "docs/*/*.js",
+        "docs/assets/*.js",
+        "docs/*/assets/*.js",
     )
 ]
 GENERATED_RULES = {
