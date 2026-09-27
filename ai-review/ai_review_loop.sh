@@ -28,13 +28,14 @@
 #   on a fresh runner before pushing.
 #
 # Required env: BASE_REF, CLAUDE_API_KEY, CODEX_API_KEY, SANDBOX_IMAGE (built from sandbox/)
-# Optional env: MAX_TURNS, CLAUDE_MODEL, CODEX_MODEL, CLAUDE_MAX_BUDGET_USD, CODEX_SANDBOX,
+# Optional env: MAX_TURNS, TIME_LIMIT_MINUTES, CLAUDE_MODEL, CODEX_MODEL, CLAUDE_MAX_BUDGET_USD, CODEX_SANDBOX,
 #               CI_FAILURES_FILE (failed CI job logs from ai_review_gate.sh), CI_FAILURE_COUNT,
 #               REVIEW_INSTRUCTIONS (repository-specific guidance for the prompt), GITHUB_RUN_ID,
 #               RESULT_DIR, ANTHROPIC_UPSTREAM and OPENAI_UPSTREAM (where the proxy sends each API's calls)
 #
 # Writes $RESULT_DIR/status (converged, max_turns or error), $RESULT_DIR/body.md (the review
-# summary) and $RESULT_DIR/patches/*.patch (the fix commits, if any).
+# summary) and $RESULT_DIR/patches/*.patch (the fix commits, if any). They are rewritten after every
+# turn, so a job killed partway through still hands the publish job the fixes committed so far.
 
 set -euo pipefail
 
@@ -44,6 +45,8 @@ set -euo pipefail
 : "${SANDBOX_IMAGE:?SANDBOX_IMAGE is required}"
 
 MAX_TURNS="${MAX_TURNS:-6}"
+# Keep under the job's timeout-minutes, leaving time for the setup steps and the upload
+TIME_LIMIT_MINUTES="${TIME_LIMIT_MINUTES:-75}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-5-5}"
 CLAUDE_MAX_BUDGET_USD="${CLAUDE_MAX_BUDGET_USD:-5}"
 # The container is the sandbox; Codex's own needs user namespaces, which containers do not get
@@ -79,16 +82,39 @@ WORK="$SANDBOX_DIR/work"
 TURN_OUT="$SANDBOX_DIR/out"
 NETWORK="ai-review-$$"
 PROXY="ai-review-proxy-$$"
+AGENT="ai-review-agent-$$"
+watchdog_pid=""
 # The agent may have taken its own permissions away from what it wrote
 remove_sandbox_files() {
   chmod -R u+rwX "$WORK" "$TURN_OUT" 2> /dev/null || true
   rm -rf "$WORK" "$TURN_OUT"
 }
 cleanup() {
-  docker rm -f "$PROXY" > /dev/null 2>&1 || true
+  stop_watchdog
+  docker rm -f "$AGENT" "$PROXY" > /dev/null 2>&1 || true
   docker network rm "$NETWORK" > /dev/null 2>&1 || true
   remove_sandbox_files
   rm -rf "$SANDBOX_DIR"
+}
+# Removes the agent's container once the review's time is up, which ends its turn. It tries for a
+# minute in case the time runs out before the container starts. The sleeps run in the background
+# so the trap can stop them with the watchdog rather than leave them behind.
+start_watchdog() {
+  (
+    trap 'kill "$sleeper" 2> /dev/null; exit' TERM
+    sleep "$1" & sleeper=$!
+    wait "$sleeper"
+    for _ in $(seq 12); do
+      docker rm -f "$AGENT" || true
+      sleep 5 & sleeper=$!
+      wait "$sleeper"
+    done
+  ) > /dev/null 2>&1 < /dev/null &
+  watchdog_pid=$!
+}
+stop_watchdog() {
+  [[ -n "$watchdog_pid" ]] && kill "$watchdog_pid" 2> /dev/null || true
+  watchdog_pid=""
 }
 trap cleanup EXIT
 # --internal: containers on this network cannot reach anything outside it
@@ -121,6 +147,7 @@ import_work() {
 # different owner inside (Docker Desktop), which git would otherwise refuse.
 sandbox() {
   docker run --rm -i \
+    --name "$AGENT" \
     --network "$NETWORK" \
     --user "$(id -u):$(id -g)" \
     --cap-drop ALL \
@@ -291,13 +318,69 @@ record_turn() {
   } >> "$HISTORY"
 }
 
+# Writes the summary and status for the publish job; the patches are written as each fix is committed
+write_result() {
+  local state="$1" commits concerns
+  commits="$(git rev-list --count "$START_SHA..HEAD")"
+  {
+    echo "## AI adversarial review"
+    echo
+    if [[ -n "$CI_FAILURES_FILE" && -s "$CI_FAILURES_FILE" ]]; then
+      echo "CI had ${CI_FAILURE_COUNT:-some} failure(s) on the reviewed commit; the reviewers were asked to fix them."
+      echo
+    fi
+    case "$state" in
+      converged) echo "✅ Claude and Codex converged after $turn turn(s) with $commits fix commit(s)." ;;
+      max_turns) echo "⚠️ Stopped after the maximum of $MAX_TURNS turns without converging ($commits fix commit(s)). A human should look at the last few turns." ;;
+      error) echo "❌ A reviewer failed on turn $turn. Fixes from earlier turns ($commits commit(s)) were kept." ;;
+      timeout) echo "❌ The review ran out of its $TIME_LIMIT_MINUTES minutes. Fixes from earlier turns ($commits commit(s)) were kept." ;;
+      running) echo "❌ The review was stopped during turn $((turn + 1)), probably by the job's time limit. Fixes from earlier turns ($commits commit(s)) were kept." ;;
+    esac
+    echo
+    echo "Reviewed commit: \`$START_SHA\`"
+    echo
+    # Concerns from each reviewer's most recent successful turn need a human decision
+    # (reviewers alternate turns; a failed or discarded turn has no result file)
+    concerns="$(for start in "$turn" "$((turn - 1))"; do
+      for ((t = start; t >= 1; t -= 2)); do
+        if [[ -f "$OUT_DIR/result-$t.json" ]]; then
+          jq -r '.unresolved_concerns[]? | "- \(.)"' "$OUT_DIR/result-$t.json" 2> /dev/null || true
+          break
+        fi
+      done
+    done | sort -u)"
+    if [[ -n "$concerns" ]]; then
+      echo "### Open concerns for a human"
+      echo
+      echo "$concerns"
+      echo
+    fi
+    echo "<details><summary>Turn-by-turn log</summary>"
+    echo
+    cat "$HISTORY"
+    echo "</details>"
+  } > "$RESULT_DIR/body.md"
+  # A review that did not finish is reported as failed, so the commit is not marked reviewed
+  case "$state" in
+    converged | max_turns) echo "$state" ;;
+    *) echo error ;;
+  esac > "$RESULT_DIR/status"
+}
+
 reviewers=(Claude Codex)
 reviewed_claude=0
 reviewed_codex=0
 status="max_turns"
 turn=0
+time_limit=$((TIME_LIMIT_MINUTES * 60))
 
 while (( turn < MAX_TURNS )); do
+  # In case the job is killed during this turn
+  write_result running
+  if (( SECONDS >= time_limit )); then
+    status="timeout"
+    break
+  fi
   reviewer="${reviewers[turn % 2]}"
   other="${reviewers[(turn + 1) % 2]}"
   turn=$((turn + 1))
@@ -308,11 +391,13 @@ while (( turn < MAX_TURNS )); do
   before_sha="$(git rev-parse HEAD)"
 
   echo "::group::Turn $turn: $reviewer"
+  start_watchdog $((time_limit - SECONDS))
   if [[ "$reviewer" == "Claude" ]]; then
     run_claude "$prompt_file" "$result_file" "$turn" && rc=0 || rc=$?
   else
     run_codex "$prompt_file" "$result_file" && rc=0 || rc=$?
   fi
+  stop_watchdog
   stop_proxy
   echo "::endgroup::"
 
@@ -330,9 +415,14 @@ while (( turn < MAX_TURNS )); do
   fi
 
   if (( rc != 0 )) || [[ -n "$discard" ]]; then
+    status="error"
     if [[ -n "$discard" ]]; then
       echo "::error::Discarding $reviewer's turn $turn because $discard"
       echo "### Turn $turn: $reviewer's turn was discarded because $discard" >> "$HISTORY"
+    elif (( SECONDS >= time_limit )); then
+      echo "::error::$reviewer's turn $turn ran out of time"
+      echo "### Turn $turn: $reviewer ran out of time" >> "$HISTORY"
+      status="timeout"
     else
       echo "::error::$reviewer failed on turn $turn (exit $rc)"
       echo "### Turn $turn: $reviewer failed (exit $rc)" >> "$HISTORY"
@@ -340,21 +430,23 @@ while (( turn < MAX_TURNS )); do
     rm -f "$result_file"
     git reset -q --hard "$before_sha"
     git clean -fdqx
-    status="error"
     break
   fi
 
   commit=""
   if ! git diff --cached --quiet; then
+    # One line per fix: git am would take a line starting with --- or diff - as the start of the patch
     git commit -q -F - <<EOF
 fix(review): apply $reviewer review fixes (turn $turn)
 
-$(jq -r '.issues_fixed[]? | "- \(.)"' "$result_file")
+$(jq -r '.issues_fixed[]? | gsub("[\r\n]+"; " ") | "- \(.)"' "$result_file")
 
 AI-Review-Bot: true
 AI-Review-Run: $RUN_ID
 EOF
     commit="$(git rev-parse --short HEAD)"
+    git format-patch -q --binary -1 --start-number "$(git rev-list --count "$START_SHA..HEAD")" \
+      -o "$RESULT_DIR/patches" HEAD
   fi
   # Ignored files git add skipped; the next turn starts from the commit alone
   git clean -fdqx
@@ -369,47 +461,5 @@ EOF
   fi
 done
 
-commits="$(git rev-list --count "$START_SHA..HEAD")"
-if (( commits > 0 )); then
-  git format-patch -q --binary -o "$RESULT_DIR/patches" "$START_SHA..HEAD"
-fi
-
-{
-  echo "## AI adversarial review"
-  echo
-  if [[ -n "$CI_FAILURES_FILE" && -s "$CI_FAILURES_FILE" ]]; then
-    echo "CI had ${CI_FAILURE_COUNT:-some} failure(s) on the reviewed commit; the reviewers were asked to fix them."
-    echo
-  fi
-  case "$status" in
-    converged) echo "✅ Claude and Codex converged after $turn turn(s) with $commits fix commit(s)." ;;
-    max_turns) echo "⚠️ Stopped after the maximum of $MAX_TURNS turns without converging ($commits fix commit(s)). A human should look at the last few turns." ;;
-    error) echo "❌ A reviewer failed on turn $turn. Fixes from earlier turns ($commits commit(s)) were kept." ;;
-  esac
-  echo
-  echo "Reviewed commit: \`$START_SHA\`"
-  echo
-  # Concerns from each reviewer's most recent successful turn need a human decision
-  # (reviewers alternate turns; a failed or discarded turn has no result file)
-  concerns="$(for start in "$turn" "$((turn - 1))"; do
-    for ((t = start; t >= 1; t -= 2)); do
-      if [[ -f "$OUT_DIR/result-$t.json" ]]; then
-        jq -r '.unresolved_concerns[]? | "- \(.)"' "$OUT_DIR/result-$t.json" 2> /dev/null || true
-        break
-      fi
-    done
-  done | sort -u)"
-  if [[ -n "$concerns" ]]; then
-    echo "### Open concerns for a human"
-    echo
-    echo "$concerns"
-    echo
-  fi
-  echo "<details><summary>Turn-by-turn log</summary>"
-  echo
-  cat "$HISTORY"
-  echo "</details>"
-} > "$RESULT_DIR/body.md"
-
-echo "$status" > "$RESULT_DIR/status"
-echo "AI review finished: $status, $commits fix commit(s)"
+write_result "$status"
+echo "AI review finished: $status, $(git rev-list --count "$START_SHA..HEAD") fix commit(s)"

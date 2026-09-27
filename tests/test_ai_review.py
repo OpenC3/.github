@@ -93,7 +93,7 @@ with open(os.environ['DOCKER_LOG'], 'a') as output:
     output.write(json.dumps(args) + '\\n')
 if args[0] != 'run' or '-d' in args:
     sys.exit(0)
-with_value = {'--network', '--user', '--security-opt', '--tmpfs', '--pids-limit', '-e', '-v', '-w', '--cap-drop'}
+with_value = {'--name', '--network', '--user', '--security-opt', '--tmpfs', '--pids-limit', '-e', '-v', '-w', '--cap-drop'}
 env, cwd, i = {}, None, 1
 while args[i].startswith('-'):
     if args[i] in with_value:
@@ -114,7 +114,8 @@ sys.exit(subprocess.run(command, env=host | env, cwd=cwd).returncode)
 
 # Stands in for both `claude` and `codex`: records its arguments, environment and the files it can
 # see, runs the shell snippet in $AGENT_ACTIONS/<name> once if present, and returns a schema-valid
-# result carrying the lines of $AGENT_ACTIONS/<name>.concerns as unresolved concerns.
+# result carrying the lines of $AGENT_ACTIONS/<name>.concerns as unresolved concerns and the JSON
+# list in $AGENT_ACTIONS/<name>.fixed as the issues fixed.
 FAKE_AGENT = """
 import json, os, pathlib, subprocess, sys
 name = pathlib.Path(sys.argv[0]).name
@@ -132,7 +133,9 @@ if action.exists():
     verdict = 'changes_made'
 concerns_file = pathlib.Path(os.environ['AGENT_ACTIONS']) / (name + '.concerns')
 concerns = concerns_file.read_text().splitlines() if concerns_file.exists() else []
-result = {'verdict': verdict, 'summary': name + ' reviewed', 'issues_fixed': [], 'unresolved_concerns': concerns}
+fixed_file = pathlib.Path(os.environ['AGENT_ACTIONS']) / (name + '.fixed')
+fixed = json.loads(fixed_file.read_text()) if fixed_file.exists() else []
+result = {'verdict': verdict, 'summary': name + ' reviewed', 'issues_fixed': fixed, 'unresolved_concerns': concerns}
 if name == 'claude':
     print(json.dumps({'is_error': False, 'structured_output': result}))
 else:
@@ -268,7 +271,7 @@ class ReviewTests(unittest.TestCase):
     def statuses(self):
         return self.fixtures["repos/owner/repo/commits/test-head/statuses"]
 
-    def run_loop(self, claude_action=None, codex_action=None):
+    def run_loop(self, claude_action=None, codex_action=None, check=True, extra=None):
         repository = self.directory / "pr"
         repository.mkdir()
 
@@ -302,6 +305,7 @@ class ReviewTests(unittest.TestCase):
             "AGENT_LOG": str(self.directory / "agents.jsonl"),
             "AGENT_ACTIONS": str(actions),
             "DOCKER_LOG": str(self.directory / "docker.jsonl"),
+            **(extra or {}),
         }
         result = subprocess.run(
             ["bash", str(ROOT / "ai-review/ai_review_loop.sh")],
@@ -311,7 +315,8 @@ class ReviewTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        if check:
+            self.assertEqual(result.returncode, 0, result.stderr)
         log = self.directory / "agents.jsonl"
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         new_commits = git("rev-list", "--count", f"{start}..HEAD")
@@ -383,6 +388,40 @@ class ReviewTests(unittest.TestCase):
         result, _, _, _ = self.run_loop(claude_action=action, codex_action="echo again >> feature.py")
         self.assertEqual(result["status"], "error")
         self.assertIn("### Open concerns for a human\n\n- needs a human decision", result["body"])
+
+    def test_killed_job_still_hands_over_earlier_fixes(self):
+        # Codex's turn is killed along with the loop, as a job timeout would; Claude's fix survives
+        kill_loop = 'p=$PPID; for _ in 1 2; do p=$(ps -o ppid= -p "$p" | tr -d " "); done; kill -9 "$p"'
+        result, _, _, new_commits = self.run_loop(
+            claude_action="echo fixed >> feature.py",
+            codex_action=kill_loop,
+            check=False,
+            # The killed loop cannot stop its watchdog, so keep it short
+            extra={"TIME_LIMIT_MINUTES": "1"},
+        )
+        self.assertEqual(new_commits, "1")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(len(result["patches"]), 1)
+        self.assertIn("stopped during turn 2", result["body"])
+
+    def test_review_stops_at_its_time_limit(self):
+        result, calls, _, _ = self.run_loop(extra={"TIME_LIMIT_MINUTES": "0"})
+        self.assertEqual(calls, [])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("ran out of its 0 minutes", result["body"])
+
+    def test_fix_descriptions_cannot_cut_the_commit_message(self):
+        (self.directory / "actions").mkdir()
+        (self.directory / "actions/claude.fixed").write_text(json.dumps(["a pasted diff\n---\ndiff --git a/x b/x"]))
+        result, _, repository, _ = self.run_loop(claude_action="echo fixed >> feature.py")
+        self.assertEqual(result["status"], "converged")
+        # Apply the patch as the publish job does and check the trailers survive
+        patch = self.directory / "out/result/patches" / result["patches"][0]
+        subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=repository, check=True)
+        subprocess.run(["git", "am", "-q", "--no-3way", str(patch)], cwd=repository, check=True)
+        message = subprocess.check_output(["git", "log", "-1", "--format=%B"], cwd=repository, text=True)
+        self.assertIn("\nAI-Review-Bot: true\n", message)
+        self.assertIn("- a pasted diff --- diff --git a/x b/x\n", message)
 
     def test_turn_that_changes_ci_config_is_discarded(self):
         for path in (

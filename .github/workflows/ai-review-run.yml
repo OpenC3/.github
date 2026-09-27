@@ -162,6 +162,7 @@ jobs:
     needs: gate
     if: needs.gate.outputs.skip == 'false'
     runs-on: ubuntu-latest
+    # The loop stops its turns after its TIME_LIMIT_MINUTES (75 by default), leaving time for the other steps
     timeout-minutes: 90
     # Read-only: the agents run on this runner, and a push happens only in the publish job
     permissions:
