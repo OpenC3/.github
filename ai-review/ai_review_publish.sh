@@ -67,7 +67,7 @@ contains_secret() {
 # Applies the fix commits and checks them; if they may not be pushed, prints why and fails
 apply_fixes() {
   local patches=("$@") commit
-  if ! git am -q --no-3way "${patches[@]}" > /dev/null 2>&1; then
+  if ! git am -q --no-3way --keep-cr "${patches[@]}" > /dev/null 2>&1; then
     git am --abort > /dev/null 2>&1 || true
     echo "they did not apply to $HEAD_SHA"
     return 1

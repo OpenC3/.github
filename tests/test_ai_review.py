@@ -571,6 +571,21 @@ class ReviewTests(unittest.TestCase):
         )
         self.assertTrue(comment.startswith(f"<!-- ai-adversarial-review -->\n<!-- ai-review-sha: {head} -->\n"))
 
+    def test_publish_applies_fixes_to_crlf_files(self):
+        repository, remote, git, _ = self.make_publish_repo()
+        (repository / "run.bat").write_bytes(b"@echo off\r\necho 1\r\n")
+        git("add", ".")
+        git("commit", "-q", "-m", "batch file")
+        git("push", "-q", str(remote), "HEAD:refs/heads/feature")
+        head = git("rev-parse", "HEAD")
+        self.fix_patches(git, head, ["printf 'echo 2\\r\\n' >> run.bat"])
+        run, status, comment, pushed = self.publish(repository, remote, head)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(status, "converged", comment)
+        self.assertNotEqual(pushed, head)
+        contents = subprocess.check_output(["git", "show", f"{pushed}:run.bat"], cwd=remote)
+        self.assertEqual(contents, b"@echo off\r\necho 1\r\necho 2\r\n")
+
     def test_publish_refuses_fixes_the_policy_forbids(self):
         for change, reason in (
             ("mkdir -p .github/workflows && echo 'on: push' > .github/workflows/ci.yml", "CI workflows"),
