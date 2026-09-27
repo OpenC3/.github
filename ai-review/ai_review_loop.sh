@@ -15,127 +15,164 @@
 # The loop converges when a reviewer makes no changes after both reviewers have
 # had at least one turn, or stops after MAX_TURNS.
 #
-# Required env: BASE_REF, CLAUDE_KEY_FILE, CODEX_KEY_FILE (files holding the API keys; deleted on start)
+# Every turn runs in a throwaway container (see sandbox/Dockerfile) that holds
+# nothing worth escaping for:
+# - Its network has no route out. The only other member is an API proxy
+#   (sandbox/api_proxy.py) holding that turn's key, so no agent ever sees a key.
+# - The agent works on a copy of the tree, with the repository's .git mounted
+#   read-only, so it cannot plant git config or hooks for the harness. The copy
+#   comes back without any .git, and fresh from the last commit each turn, so
+#   nothing an agent leaves outside the commits reaches the next agent.
+# - This job has no token that can write to GitHub. The fix commits leave as
+#   patches for the publish job (ai_review_publish.sh), which checks them again
+#   on a fresh runner before pushing.
+#
+# Required env: BASE_REF, CLAUDE_API_KEY, CODEX_API_KEY, SANDBOX_IMAGE (built from sandbox/)
 # Optional env: MAX_TURNS, CLAUDE_MODEL, CODEX_MODEL, CLAUDE_MAX_BUDGET_USD, CODEX_SANDBOX,
 #               CI_FAILURES_FILE (failed CI job logs from ai_review_gate.sh), CI_FAILURE_COUNT,
-#               REVIEW_INSTRUCTIONS (repository-specific guidance for the prompt), GITHUB_RUN_ID
+#               REVIEW_INSTRUCTIONS (repository-specific guidance for the prompt), GITHUB_RUN_ID,
+#               RESULT_DIR, ANTHROPIC_UPSTREAM and OPENAI_UPSTREAM (where the proxy sends each API's calls)
 #
-# Writes $OUT_DIR/comment.md and sets the `status` and `commits` step outputs.
+# Writes $RESULT_DIR/status (converged, max_turns or error), $RESULT_DIR/body.md (the review
+# summary) and $RESULT_DIR/patches/*.patch (the fix commits, if any).
 
 set -euo pipefail
 
 : "${BASE_REF:?BASE_REF is required}"
-: "${CLAUDE_KEY_FILE:?CLAUDE_KEY_FILE is required}"
-: "${CODEX_KEY_FILE:?CODEX_KEY_FILE is required}"
-
-# Keys are read from files deleted before any agent starts and are never exported: an exported
-# variable stays readable in this process's /proc/<pid>/environ for the whole run, so Codex could
-# read Claude's key (and the reverse) through its parent process.
-CLAUDE_API_KEY="$(< "$CLAUDE_KEY_FILE")"
-CODEX_API_KEY="$(< "$CODEX_KEY_FILE")"
-rm -f "$CLAUDE_KEY_FILE" "$CODEX_KEY_FILE"
-export -n CLAUDE_API_KEY CODEX_API_KEY
-[[ -n "$CLAUDE_API_KEY" && -n "$CODEX_API_KEY" ]] || { echo "::error::An API key file is empty"; exit 1; }
-
-# Agents can write inside the checkout, and the harness runs git outside their sandbox with the
-# keys in memory. Never run hooks or an fsmonitor from .git, whoever wrote them, and ignore the
-# global and system config so a file planted outside the checkout cannot add filters or drivers.
-export GIT_CONFIG_COUNT=2
-export GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
-export GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false
-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
-# Pin the repository too: a .git/commondir file (read in any repository, not only worktrees) would
-# otherwise point git at a config outside .git that the snapshot below never sees
-REPO_TOP="$(git rev-parse --show-toplevel)"
-export GIT_DIR="$REPO_TOP/.git" GIT_COMMON_DIR="$REPO_TOP/.git" GIT_WORK_TREE="$REPO_TOP"
-
-# The runner reads these files after the step to set outputs, env and PATH for later steps, such as
-# the push that holds the push token. Hide their paths from the agents; outputs are written below.
-OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
-export -n GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY 2> /dev/null || true
+: "${CLAUDE_API_KEY:?CLAUDE_API_KEY is required}"
+: "${CODEX_API_KEY:?CODEX_API_KEY is required}"
+: "${SANDBOX_IMAGE:?SANDBOX_IMAGE is required}"
 
 MAX_TURNS="${MAX_TURNS:-6}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-5-5}"
 CLAUDE_MAX_BUDGET_USD="${CLAUDE_MAX_BUDGET_USD:-5}"
-CODEX_SANDBOX="${CODEX_SANDBOX:-workspace-write}"
+# The container is the sandbox; Codex's own needs user namespaces, which containers do not get
+CODEX_SANDBOX="${CODEX_SANDBOX:-danger-full-access}"
 OUT_DIR="${OUT_DIR:-${RUNNER_TEMP:-/tmp}/ai-review}"
+RESULT_DIR="${RESULT_DIR:-$OUT_DIR/result}"
+ANTHROPIC_UPSTREAM="${ANTHROPIC_UPSTREAM:-https://api.anthropic.com}"
+OPENAI_UPSTREAM="${OPENAI_UPSTREAM:-https://api.openai.com}"
 
-# Run from the PR checkout; the prompt and schema live next to this script
+# Run from the PR checkout; the prompt, schema and policy live next to this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROMPT_TEMPLATE="$SCRIPT_DIR/prompt.md"
 SCHEMA="$SCRIPT_DIR/schema.json"
+POLICY="$SCRIPT_DIR/patch_policy.py"
 HISTORY="$OUT_DIR/history.md"
 CI_FAILURES_FILE="${CI_FAILURES_FILE:-}"
 RUN_ID="${GITHUB_RUN_ID:-local}"
 
+# Keep the runner's system and user git config (such as its LFS filter) out of the harness's git
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+
+REPO="$(git rev-parse --show-toplevel)"
 mkdir -p "$OUT_DIR"
+rm -rf "$RESULT_DIR"
+mkdir -p "$RESULT_DIR/patches"
 : > "$HISTORY"
 
 MERGE_BASE="$(git merge-base "origin/$BASE_REF" HEAD)"
 START_SHA="$(git rev-parse HEAD)"
 
-# Each turn gets an empty HOME outside the checkout and OUT_DIR, so nothing an agent writes there
-# (user settings, hooks, Codex config) is loaded by the next agent
-AGENT_HOME="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ai-review-home.XXXXXX")"
-CODEX_AUTH="$AGENT_HOME/.codex/auth.json"
-trap 'rm -rf "$AGENT_HOME"' EXIT
-fresh_agent_home() {
-  rm -rf "$AGENT_HOME"
-  mkdir -p "$AGENT_HOME/.codex"
+SANDBOX_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ai-review-sandbox.XXXXXX")"
+WORK="$SANDBOX_DIR/work"
+TURN_OUT="$SANDBOX_DIR/out"
+NETWORK="ai-review-$$"
+PROXY="ai-review-proxy-$$"
+# The agent may have taken its own permissions away from what it wrote
+remove_sandbox_files() {
+  chmod -R u+rwX "$WORK" "$TURN_OUT" 2> /dev/null || true
+  rm -rf "$WORK" "$TURN_OUT"
+}
+cleanup() {
+  docker rm -f "$PROXY" > /dev/null 2>&1 || true
+  docker network rm "$NETWORK" > /dev/null 2>&1 || true
+  remove_sandbox_files
+  rm -rf "$SANDBOX_DIR"
+}
+trap cleanup EXIT
+# --internal: containers on this network cannot reach anything outside it
+docker network create --internal "$NETWORK" > /dev/null
+
+# Copies a tree without any .git, at any depth
+copy_tree() {
+  (cd "$1" && tar --exclude=.git -cf - .) | (cd "$2" && tar -xpf -)
 }
 
-# Files that steer the agents or this review, in the reviewed repository or in OpenC3/.github
-# itself; keep in sync with PROTECTED_PATHS in malicious_code_scan.py (tests/test_ai_review.py
-# checks). A turn that changes one is discarded: the next agent would load it.
-AGENT_CONFIG_RE='(^|/)(CLAUDE(\.local)?\.md|AGENTS(\.override)?\.md|\.mcp\.json)$|(^|/)\.(claude|codex|cursor)/'
-AGENT_CONFIG_RE+='|^\.github/copilot-instructions\.md$|^(ai-review|malicious-code-scan)/'
-AGENT_CONFIG_RE+='|^\.github/workflows/(ai[-_]review|malicious[-_]code[-_]scan)(-reusable)?\.ya?ml$'
-# Workflows and actions run with secrets on the next CI run, and pushing them needs a token with
-# the workflows scope; agents report needed changes instead
-CI_CONFIG_RE='^\.github/(workflows|actions)/'
+# The agent's copy of the last commit. .git is a mount point, created here so docker does not
+# create it as root.
+prepare_work() {
+  remove_sandbox_files
+  mkdir -p "$WORK/.git" "$TURN_OUT"
+  copy_tree "$REPO" "$WORK"
+}
 
-# Git config, hooks and alternates the agents could plant to run code the next time the harness
-# calls git. They are copied at the start and compared after every turn.
-GIT_CONTROL_PATHS=(config info hooks objects/info commondir)
-snapshot_git() {
-  local dest="$1" path
-  rm -rf "$dest"
-  mkdir -p "$dest"
-  for path in "${GIT_CONTROL_PATHS[@]}"; do
-    if [[ -e ".git/$path" || -L ".git/$path" ]]; then
-      mkdir -p "$dest/$(dirname "$path")"
-      cp -RP ".git/$path" "$dest/$path"
+# Replaces the checkout's tree with the agent's. Fails on anything git add could not take (a FIFO,
+# an unreadable file); the caller then resets the checkout.
+import_work() {
+  [[ -z "$(find "$WORK" -path "$WORK/.git" -prune -o ! -type f ! -type d ! -type l -print)" ]] || return 1
+  find "$REPO" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+  copy_tree "$WORK" "$REPO"
+}
+
+# Runs an image in a throwaway container: no capabilities, a read-only root, an empty HOME, the
+# agent's copy of the tree with the repository's .git read-only, and the turn's output directory.
+# Host paths are mounted at the same paths so arguments need no translating. The mounts may show a
+# different owner inside (Docker Desktop), which git would otherwise refuse.
+sandbox() {
+  docker run --rm -i \
+    --network "$NETWORK" \
+    --user "$(id -u):$(id -g)" \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --read-only \
+    --tmpfs /tmp:exec \
+    --tmpfs /home/agent:exec,mode=1777 \
+    --pids-limit 4096 \
+    -e HOME=/home/agent \
+    -e GIT_CONFIG_COUNT=1 \
+    -e GIT_CONFIG_KEY_0=safe.directory \
+    -e GIT_CONFIG_VALUE_0="$WORK" \
+    -v "$WORK:$WORK" \
+    -v "$REPO/.git:$WORK/.git:ro" \
+    -v "$TURN_OUT:$TURN_OUT" \
+    -w "$WORK" \
+    "$@"
+}
+
+# Starts the proxy for one turn with one key. It is created on the default bridge, which reaches
+# the internet, and then joins the agents' network, where agents reach it by name.
+start_proxy() {
+  local upstream="$1" auth="$2" key="$3" routes="$4"
+  docker rm -f "$PROXY" > /dev/null 2>&1 || true
+  # -e without a value passes the key from this environment rather than the command line
+  PROXY_API_KEY="$key" docker run -d --name "$PROXY" \
+    --user 65534:65534 \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --read-only \
+    -e PROXY_UPSTREAM="$upstream" \
+    -e PROXY_AUTH="$auth" \
+    -e PROXY_API_KEY \
+    -e PROXY_ROUTES="$routes" \
+    "$SANDBOX_IMAGE" python3 /opt/ai-review/api_proxy.py > /dev/null
+  docker network connect "$NETWORK" "$PROXY"
+  local attempt
+  for attempt in $(seq 50); do
+    if docker exec "$PROXY" python3 -c "import socket; socket.create_connection(('127.0.0.1', 8080), 1)" \
+      > /dev/null 2>&1; then
+      return 0
     fi
+    sleep 0.2
   done
-}
-GIT_SNAPSHOT="$OUT_DIR/git-snapshot"
-snapshot_git "$GIT_SNAPSHOT"
-git_unchanged() {
-  snapshot_git "$OUT_DIR/git-current"
-  diff -r --no-dereference "$GIT_SNAPSHOT" "$OUT_DIR/git-current" > /dev/null 2>&1
+  echo "::error::The API proxy did not start after $attempt attempts" >&2
+  docker logs "$PROXY" >&2 || true
+  return 1
 }
 
-# git add -A skips ignored files, so an agent could plant agent config (or add it to .gitignore)
-# where the staged-change check never sees it and git clean leaves it for the next agent. Lists the
-# ignored files matching AGENT_CONFIG_RE with a hash of each, so a turn that adds or edits one shows.
-ignored_agent_config() {
-  local path
-  git -c core.quotePath=false ls-files -o -i --exclude-standard -z | while IFS= read -r -d '' path; do
-    # A here-string keeps a newline inside a name from hiding it, as for the staged paths below
-    if grep -Eq "$AGENT_CONFIG_RE" <<< "$path"; then
-      printf '%s %s\n' "$(git hash-object --no-filters -- "$path" 2> /dev/null || echo unreadable)" "$path"
-    fi
-  done
-}
-
-# Succeeds if stdin contains an API key. Agents can read files on the runner, so anything they
-# write is checked before it is committed or posted. This only catches exact copies; an encoded
-# key gets through, so the malicious code scan that gates this review remains the real defense.
-# No grep -q: exiting early would SIGPIPE the writer, and pipefail would read that as no match.
-leaks_secret() {
-  local patterns
-  patterns="$(printf '%s\n' "$CLAUDE_API_KEY" "$CODEX_API_KEY" | grep -v '^$' || true)"
-  [[ -n "$patterns" ]] && grep -F -f <(echo "$patterns") > /dev/null
+stop_proxy() {
+  docker logs "$PROXY" 2>&1 | grep -F refused >&2 || true
+  docker rm -f "$PROXY" > /dev/null 2>&1 || true
 }
 
 build_prompt() {
@@ -193,11 +230,13 @@ validate_result() {
 
 run_claude() {
   local prompt_file="$1" result_file="$2" raw="$OUT_DIR/claude-raw-$3.json"
-  # Project settings and MCP servers could come from the PR or an earlier agent turn and would run
-  # hooks outside any sandbox, so only the runner's own settings are loaded. Writes to .git are denied:
-  # a diff.external or textconv driver added to .git/config would run on Claude's own git diff, and
-  # the check that git is unchanged only runs after the turn
-  HOME="$AGENT_HOME" ANTHROPIC_API_KEY="$CLAUDE_API_KEY" \
+  start_proxy "$ANTHROPIC_UPSTREAM" x-api-key "$CLAUDE_API_KEY" 'POST /v1/messages(/count_tokens)?|HEAD /api/hello' || return 1
+  # Settings and MCP servers from the PR are not loaded, so the PR cannot change the tools below
+  sandbox \
+    -e ANTHROPIC_BASE_URL="http://$PROXY:8080" \
+    -e ANTHROPIC_API_KEY=placeholder-the-proxy-adds-the-key \
+    -e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    "$SANDBOX_IMAGE" \
     claude -p \
       --model "$CLAUDE_MODEL" \
       --setting-sources user \
@@ -208,9 +247,6 @@ run_claude() {
       --permission-mode acceptEdits \
       --allowedTools "Read(./**)" "Edit(./**)" "Write(./**)" "Glob" "Grep" \
         "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(git status:*)" "Bash(git blame:*)" \
-      --disallowedTools "Read(~/.codex/**)" "Read(//proc/**)" "Edit(./.git/**)" "Write(./.git/**)" \
-        "Bash(git diff --no-index:*)" \
-        "Bash(git *--output*)" \
       < "$prompt_file" > "$raw" || return $?
   if jq -e '.is_error == true' "$raw" > /dev/null; then
     jq -r '.result // "unknown error"' "$raw" >&2
@@ -224,20 +260,22 @@ run_codex() {
   local prompt_file="$1" result_file="$2"
   local model_args=()
   [[ -n "${CODEX_MODEL:-}" ]] && model_args=(--model "$CODEX_MODEL")
-  # Codex reads the key from auth.json, which exists only for its own turn so Claude cannot read it
-  export HOME="$AGENT_HOME" CODEX_HOME="$AGENT_HOME/.codex"
-  printf '%s' "$CODEX_API_KEY" | codex login --with-api-key > /dev/null
-  codex exec \
-    ${model_args[@]+"${model_args[@]}"} \
-    --sandbox "$CODEX_SANDBOX" \
-    -c 'approval_policy="never"' \
-    --ephemeral \
-    --output-schema "$SCHEMA" \
-    --output-last-message "$result_file" \
-    - < "$prompt_file" && rc=0 || rc=$?
-  codex logout > /dev/null 2>&1 || true
-  rm -f "$CODEX_AUTH"
-  (( rc == 0 )) || return "$rc"
+  start_proxy "$OPENAI_UPSTREAM" bearer "$CODEX_API_KEY" 'POST /v1/responses(/compact)?|GET /v1/models' || return 1
+  cp "$SCHEMA" "$TURN_OUT/schema.json"
+  sandbox \
+    -e AI_REVIEW_PROXY_KEY=placeholder-the-proxy-adds-the-key \
+    "$SANDBOX_IMAGE" \
+    codex exec \
+      ${model_args[@]+"${model_args[@]}"} \
+      -c 'model_provider="ai_review_proxy"' \
+      -c "model_providers.ai_review_proxy={ name = \"OpenAI via the AI review proxy\", base_url = \"http://$PROXY:8080/v1\", env_key = \"AI_REVIEW_PROXY_KEY\", wire_api = \"responses\" }" \
+      --sandbox "$CODEX_SANDBOX" \
+      -c 'approval_policy="never"' \
+      --ephemeral \
+      --output-schema "$TURN_OUT/schema.json" \
+      --output-last-message "$TURN_OUT/result.json" \
+      - < "$prompt_file" || return $?
+  cp "$TURN_OUT/result.json" "$result_file" || return $?
   validate_result "$result_file"
 }
 
@@ -257,7 +295,6 @@ reviewers=(Claude Codex)
 reviewed_claude=0
 reviewed_codex=0
 status="max_turns"
-tampered=0
 turn=0
 
 while (( turn < MAX_TURNS )); do
@@ -267,49 +304,30 @@ while (( turn < MAX_TURNS )); do
   prompt_file="$OUT_DIR/prompt-$turn.md"
   result_file="$OUT_DIR/result-$turn.json"
   build_prompt "$reviewer" "$other" "$turn" "$prompt_file"
-  fresh_agent_home
+  prepare_work
+  before_sha="$(git rev-parse HEAD)"
 
   echo "::group::Turn $turn: $reviewer"
-  before_sha="$(git rev-parse HEAD)"
-  ignored_before="$(ignored_agent_config)"
   if [[ "$reviewer" == "Claude" ]]; then
     run_claude "$prompt_file" "$result_file" "$turn" && rc=0 || rc=$?
   else
-    # Subshell so the agent HOME does not leak into the harness
-    (run_codex "$prompt_file" "$result_file") && rc=0 || rc=$?
+    run_codex "$prompt_file" "$result_file" && rc=0 || rc=$?
   fi
+  stop_proxy
   echo "::endgroup::"
-
-  # Checked before git runs again: planted config could run code when it does. Stop without
-  # committing, cleaning up, or pushing anything, since any of those would run git.
-  if ! git_unchanged; then
-    echo "::error::$reviewer changed git's config or hooks on turn $turn; stopping without committing or pushing"
-    echo "### Turn $turn: $reviewer changed git's config or hooks; the run was stopped and nothing was pushed" >> "$HISTORY"
-    rm -f "$result_file"
-    status="error"
-    tampered=1
-    break
-  fi
 
   discard=""
   if (( rc == 0 )); then
-    git add -A
-    # An agent that wrote a key into the tree or its result must not get it committed or posted
-    # --text: a NUL byte or a -diff attribute would otherwise print "Binary files differ" instead of the key
-    if { git diff --cached --text --no-ext-diff --no-textconv "$before_sha" && cat "$result_file"; } | leaks_secret; then
-      discard="it contained an API key"
+    if ! import_work; then
+      discard="it left files that could not be copied back (a FIFO or an unreadable file, say)"
     else
-      # Unquoted: git otherwise wraps non-ASCII paths in quotes, which the ^ anchors would miss.
-      # -z and tr keep a newline inside a name from hiding it (each piece starts a line).
-      changed="$(git -c core.quotePath=false diff --cached --name-only --no-renames -z "$before_sha" | tr '\0' '\n')"
-      if grep -Eq "$AGENT_CONFIG_RE" <<< "$changed" || [[ "$(ignored_agent_config)" != "$ignored_before" ]]; then
-        discard="it changed files that configure the AI agents or this review"
-      elif grep -Eq "$CI_CONFIG_RE" <<< "$changed"; then
-        discard="it changed CI workflows or actions"
+      git add -A
+      # Fail closed: a policy check that crashes refuses the turn too
+      if ! reason="$(python3 "$POLICY" "$before_sha")"; then
+        discard="${reason:-the change policy check failed}"
       fi
     fi
   fi
-  git reset -q
 
   if (( rc != 0 )) || [[ -n "$discard" ]]; then
     if [[ -n "$discard" ]]; then
@@ -320,17 +338,12 @@ while (( turn < MAX_TURNS )); do
       echo "### Turn $turn: $reviewer failed (exit $rc)" >> "$HISTORY"
     fi
     rm -f "$result_file"
-    # Keep whatever the agent left half-done out of the branch
-    git reset --hard "$before_sha" > /dev/null
-    # -x: ignored files too, so agent config hidden behind .gitignore goes as well
+    git reset -q --hard "$before_sha"
     git clean -fdqx
     status="error"
     break
   fi
 
-  # An agent is told not to commit, but fold any commits it made anyway into this turn
-  git reset --soft "$before_sha"
-  git add -A
   commit=""
   if ! git diff --cached --quiet; then
     git commit -q -F - <<EOF
@@ -343,6 +356,8 @@ AI-Review-Run: $RUN_ID
 EOF
     commit="$(git rev-parse --short HEAD)"
   fi
+  # Ignored files git add skipped; the next turn starts from the commit alone
+  git clean -fdqx
 
   if [[ "$reviewer" == "Claude" ]]; then reviewed_claude=1; else reviewed_codex=1; fi
   record_turn "$turn" "$reviewer" "$result_file" "$commit"
@@ -354,17 +369,12 @@ EOF
   fi
 done
 
-# After tampering, report no commits so nothing is pushed, and do not run git again
-commits=0
-(( tampered )) || commits="$(git rev-list --count "$START_SHA..HEAD")"
+commits="$(git rev-list --count "$START_SHA..HEAD")"
+if (( commits > 0 )); then
+  git format-patch -q --binary -o "$RESULT_DIR/patches" "$START_SHA..HEAD"
+fi
 
 {
-  echo "<!-- ai-adversarial-review -->"
-  # The marker stops later runs from reviewing this commit again, so leave it off when a reviewer
-  # failed (an API outage, say) and a rerun could succeed. Tampering is not retried.
-  if [[ "$status" != "error" ]] || (( tampered )); then
-    echo "<!-- ai-review-sha: $START_SHA -->"
-  fi
   echo "## AI adversarial review"
   echo
   if [[ -n "$CI_FAILURES_FILE" && -s "$CI_FAILURES_FILE" ]]; then
@@ -374,13 +384,7 @@ commits=0
   case "$status" in
     converged) echo "✅ Claude and Codex converged after $turn turn(s) with $commits fix commit(s)." ;;
     max_turns) echo "⚠️ Stopped after the maximum of $MAX_TURNS turns without converging ($commits fix commit(s)). A human should look at the last few turns." ;;
-    error)
-      if (( tampered )); then
-        echo "❌ A reviewer changed git's config or hooks on turn $turn. The run was stopped and no fixes were pushed."
-      else
-        echo "❌ A reviewer failed on turn $turn. Fixes from earlier turns ($commits commit(s)) were kept."
-      fi
-      ;;
+    error) echo "❌ A reviewer failed on turn $turn. Fixes from earlier turns ($commits commit(s)) were kept." ;;
   esac
   echo
   echo "Reviewed commit: \`$START_SHA\`"
@@ -405,7 +409,7 @@ commits=0
   echo
   cat "$HISTORY"
   echo "</details>"
-} > "$OUT_DIR/comment.md"
+} > "$RESULT_DIR/body.md"
 
-echo "status=$status" >> "$OUTPUT_FILE"
-echo "commits=$commits" >> "$OUTPUT_FILE"
+echo "$status" > "$RESULT_DIR/status"
+echo "AI review finished: $status, $commits fix commit(s)"

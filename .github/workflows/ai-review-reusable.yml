@@ -1,26 +1,30 @@
 # Adversarial AI review: once every CI run for the PR head has finished and the
 # Malicious Code Scan has passed (see malicious-code-scan-reusable.yml), Claude
 # and Codex take turns reviewing the PR, fixing CI failures and other issues,
-# and committing fixes until one of them approves without changes (see
-# ai-review/ai_review_gate.sh and ai-review/ai_review_loop.sh).
+# and committing fixes until one of them approves without changes. This
+# workflow finds the PR and queues its reviews; ai-review-run.yml does the
+# review itself, split across runners so the agents never share one with a
+# token that can write (see that file).
 #
 # Called from workflow-templates/ai-review.yml, which a repository copies in and
 # triggers on workflow_run (once per completed CI workflow) and on
-# workflow_dispatch (which the scan uses when it passes). The gate step lets
-# only the run that sees everything finished go ahead. workflow_run only uses
-# the caller's copy on its default branch, and the scripts and prompt come from
-# this repository, so a PR cannot change how it is reviewed.
+# workflow_dispatch (which the scan uses when it passes). The gate lets only the
+# run that sees everything finished go ahead. workflow_run only uses the
+# caller's copy on its default branch, and the scripts and prompt come from this
+# repository, so a PR cannot change how it is reviewed.
 #
 # Secrets:
 #   ANTHROPIC_API_KEY     - Claude API key (required)
 #   OPENAI_API_KEY        - Codex / OpenAI API key (required)
-#   AI_REVIEW_PUSH_TOKEN  - PAT or GitHub App token with contents:write, needed to push fixes.
-#                           Without it the review still runs and comments, but fixes are not
-#                           pushed: a GITHUB_TOKEN push triggers neither CI nor the Malicious Code
-#                           Scan, so the required scan status would never report on the new head
-#                           and the PR could not merge until someone pushed again.
+#   AI_REVIEW_PUSH_TOKEN  - Token that pushes fixes: a GitHub App token (or fine-grained PAT) with
+#                           contents:write on this repository and no workflows permission, so
+#                           GitHub itself refuses a push that changes a workflow. Without it the
+#                           review still runs and comments, but fixes are not pushed: a
+#                           GITHUB_TOKEN push triggers neither CI nor the Malicious Code Scan, so
+#                           the required scan status would never report on the new head and the
+#                           PR could not merge until someone pushed again.
 #
-# The caller must grant the job actions: read, contents: write, pull-requests: write and
+# The caller must grant the job actions: read, contents: read, pull-requests: write and
 # statuses: read. Add the `skip-ai-review` label to a PR to opt out.
 #
 # Third party actions are pinned to a full commit SHA, because a tag can be moved
@@ -72,7 +76,7 @@ on:
         type: string
         default: ""
       codex_sandbox:
-        description: Codex sandbox mode (default workspace-write)
+        description: Codex sandbox mode inside the agent container (default danger-full-access; the container is the sandbox)
         required: false
         type: string
         default: ""
@@ -87,7 +91,7 @@ on:
         type: string
         default: security/malicious-code-scan
       shared_ref:
-        description: Ref of OpenC3/.github to take the scripts and prompt from; match the ref in `uses:`
+        description: Ref of OpenC3/.github to take the scripts and prompt from; match the ref in `uses:` (ai-review-run.yml is always taken from main)
         required: false
         type: string
         default: main
@@ -145,218 +149,39 @@ jobs:
           fi
           echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
 
+  # The review runs in its own reusable workflow (ai-review-run.yml) so this queue covers all of its
+  # jobs: a queued trigger cannot pass the gate while an earlier review of the PR is still
+  # publishing. One review per PR at a time; extra triggers queue and then exit in the gate. Keep
+  # every pending run (default is one) so a manual `force` dispatch is not replaced by a CI trigger.
+  # Without a PR the gate skips; key on the commit so those runs do not queue behind each other.
   review:
     needs: pr
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    # One review per PR at a time; extra triggers queue and then exit in the gate. Keep every
-    # pending run (default is one) so a manual `force` dispatch is not replaced by a CI trigger.
-    # Without a PR the gate skips; key on the commit so those runs do not queue behind each other.
     concurrency:
       group: ${{ github.workflow }}-${{ needs.pr.outputs.number || github.event.workflow_run.head_sha }}
       cancel-in-progress: false
       queue: max
+    # The most any job of the review gets; each job takes only what it needs
     permissions:
       actions: read
-      contents: write
+      contents: read
       pull-requests: write
       statuses: read
-    steps:
-      - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: OpenC3/.github
-          ref: ${{ inputs.shared_ref }}
-          sparse-checkout: ai-review
-          path: shared
-          persist-credentials: false
-
-      # The caller's workflows as merged, to check its workflow_run list is complete
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          sparse-checkout: .github/workflows
-          path: caller
-          persist-credentials: false
-
-      - name: Check the workflow_run list
-        continue-on-error: true
-        env:
-          # owner/repo/.github/workflows/<file>@<ref> of the caller
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-        run: |
-          caller_file="${WORKFLOW_REF%@*}"
-          python3 shared/ai-review/check_triggers.py caller/.github/workflows "${caller_file##*/}"
-
-      - name: Wait for CI and collect failures
-        id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER: ${{ needs.pr.outputs.number }}
-          FORCE: ${{ inputs.force }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          REVIEW_WORKFLOW: ${{ github.workflow }}
-          SCAN_WORKFLOW: ${{ inputs.scan_workflow_name }}
-          SCAN_CONTEXT: ${{ inputs.scan_status_context }}
-          MAX_CI_ROUNDS: ${{ inputs.max_ci_rounds || '3' }}
-          OUT_DIR: ${{ runner.temp }}/ai-review
-        run: bash shared/ai-review/ai_review_gate.sh
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.gate.outputs.skip == 'false'
-        with:
-          ref: ${{ steps.gate.outputs.head_ref }}
-          path: repo
-          fetch-depth: 0
-          # Keep the push token out of .git/config where the agents could read it
-          persist-credentials: false
-
-      - name: Check the branch still matches the gated commit
-        id: fresh
-        if: steps.gate.outputs.skip == 'false'
-        working-directory: repo
-        env:
-          HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
-        run: |
-          if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
-            echo "Branch moved past $HEAD_SHA; the next CI completion will trigger a new review"
-            echo "stale=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: steps.gate.outputs.skip == 'false' && steps.fresh.outputs.stale != 'true'
-        with:
-          node-version: 24
-
-      - name: Install Claude Code and Codex
-        if: steps.gate.outputs.skip == 'false' && steps.fresh.outputs.stale != 'true'
-        run: npm install -g @anthropic-ai/claude-code@2.1.283 @openai/codex@0.157.1
-
-      # Hand the keys over in files the loop deletes before any agent starts: a key set in the loop
-      # step's env would stay readable in /proc/<pid>/environ to both agents for the whole run
-      - name: Stash API keys
-        if: steps.gate.outputs.skip == 'false' && steps.fresh.outputs.stale != 'true'
-        env:
-          CLAUDE_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          KEY_DIR: ${{ runner.temp }}/ai-review-keys
-        run: |
-          umask 077
-          mkdir -p "$KEY_DIR"
-          printf '%s' "$CLAUDE_API_KEY" > "$KEY_DIR/claude"
-          printf '%s' "$CODEX_API_KEY" > "$KEY_DIR/codex"
-
-      - name: Run review loop
-        id: loop
-        if: steps.gate.outputs.skip == 'false' && steps.fresh.outputs.stale != 'true'
-        working-directory: repo
-        env:
-          BASE_REF: ${{ steps.gate.outputs.base_ref }}
-          CLAUDE_KEY_FILE: ${{ runner.temp }}/ai-review-keys/claude
-          CODEX_KEY_FILE: ${{ runner.temp }}/ai-review-keys/codex
-          MAX_TURNS: ${{ inputs.max_turns || '6' }}
-          CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-opus-5-5' }}
-          CODEX_MODEL: ${{ inputs.codex_model }}
-          CLAUDE_MAX_BUDGET_USD: ${{ inputs.claude_max_budget_usd || '5' }}
-          CODEX_SANDBOX: ${{ inputs.codex_sandbox || 'workspace-write' }}
-          REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
-          OUT_DIR: ${{ runner.temp }}/ai-review
-          CI_FAILURES_FILE: ${{ runner.temp }}/ai-review/ci_failures.md
-          CI_FAILURE_COUNT: ${{ steps.gate.outputs.ci_failures }}
-        run: |
-          # The trusted scripts run from here; agent tools such as `git diff --output` must not rewrite them
-          chmod -R a-w ../shared
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          bash ../shared/ai-review/ai_review_loop.sh
-
-      - name: Push fixes
-        id: push
-        if: steps.loop.outputs.commits != '' && steps.loop.outputs.commits != '0'
-        working-directory: repo
-        env:
-          PUSH_TOKEN: ${{ secrets.AI_REVIEW_PUSH_TOKEN }}
-          HEAD_REF: ${{ steps.gate.outputs.head_ref }}
-          HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
-          ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GITHUB_TOKEN_VALUE: ${{ github.token }}
-          COMMENT_FILE: ${{ runner.temp }}/ai-review/comment.md
-          # The agents could write to .git; never run hooks or an fsmonitor from it with the push token
-          GIT_CONFIG_COUNT: "2"
-          GIT_CONFIG_KEY_0: core.hooksPath
-          GIT_CONFIG_VALUE_0: /dev/null
-          GIT_CONFIG_KEY_1: core.fsmonitor
-          GIT_CONFIG_VALUE_1: "false"
-          # Nor filters or diff drivers from a global or system config planted outside the checkout
-          GIT_CONFIG_GLOBAL: /dev/null
-          GIT_CONFIG_NOSYSTEM: "1"
-          # Nor a config reached through a planted .git/commondir
-          GIT_DIR: ${{ github.workspace }}/repo/.git
-          GIT_COMMON_DIR: ${{ github.workspace }}/repo/.git
-          GIT_WORK_TREE: ${{ github.workspace }}/repo
-        run: |
-          note() { printf '\n> [!WARNING]\n> %s\n' "$1" >> "$COMMENT_FILE"; }
-          # The agents could read secrets on the runner; never publish a commit that contains one.
-          # No grep -q: exiting early would SIGPIPE git log, and pipefail would read that as no match.
-          # --text: a NUL byte or a -diff attribute would otherwise hide a file's contents from the grep.
-          patterns="$(printf '%s\n' "$PUSH_TOKEN" "$ANTHROPIC_KEY" "$OPENAI_KEY" "$GITHUB_TOKEN_VALUE" | grep -v '^$' || true)"
-          if git log -p --text --no-ext-diff --no-textconv --format=%B "${HEAD_SHA}..HEAD" | grep -F -f <(echo "$patterns") > /dev/null; then
-            note "The fix commits contained a secret and were not pushed. Rotate the repository's API keys and tokens."
-            echo "::error::The fix commits contain a secret; not pushing"
-            exit 1
-          fi
-          if [[ -z "$PUSH_TOKEN" ]]; then
-            note "The fix commits above were not pushed because AI_REVIEW_PUSH_TOKEN is not set."
-            echo "::warning::AI_REVIEW_PUSH_TOKEN is not set; not pushing the fix commits"
-            exit 0
-          fi
-          # Plain (non-force) push: if the author pushed meanwhile this fails rather than clobbering their work
-          if ! git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${HEAD_REF}"; then
-            note "The fix commits above could not be pushed (the branch probably moved); they were discarded."
-            exit 1
-          fi
-
-      - name: Post review summary
-        if: always() && steps.loop.outcome != 'skipped'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.gate.outputs.pr }}
-          COMMENT_FILE: ${{ runner.temp }}/ai-review/comment.md
-          PUSH_TOKEN: ${{ secrets.AI_REVIEW_PUSH_TOKEN }}
-          ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
-          HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
-        run: |
-          if [[ ! -f "$COMMENT_FILE" ]]; then
-            echo "No summary was produced"
-            exit 0
-          fi
-          # The comment quotes agent output, so it gets the same secret check as the commits
-          patterns="$(printf '%s\n' "$PUSH_TOKEN" "$ANTHROPIC_KEY" "$OPENAI_KEY" "$GH_TOKEN" | grep -v '^$' || true)"
-          if grep -F -f <(echo "$patterns") "$COMMENT_FILE" > /dev/null; then
-            echo "::error::The review summary contains a secret; posting a redacted summary"
-            printf '%s\n' "<!-- ai-adversarial-review -->" "<!-- ai-review-sha: $HEAD_SHA -->" "## AI adversarial review" "" \
-              "❌ The review summary contained a secret and was not posted. See the workflow run log." > "$COMMENT_FILE"
-          fi
-          comment_id="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate \
-            --jq '.[] | select(.user.login == "github-actions[bot]" and .user.type == "Bot")
-              | select(.body | startswith("<!-- ai-adversarial-review -->")) | .id' | tail -n 1)"
-          if [[ -n "$comment_id" ]]; then
-            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" -F "body=@${COMMENT_FILE}" > /dev/null
-          else
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$COMMENT_FILE"
-          fi
-
-      - name: Fail if the reviewers did not converge
-        if: steps.loop.outputs.status == 'error' || steps.loop.outputs.status == 'max_turns'
-        env:
-          STATUS: ${{ steps.loop.outputs.status }}
-        run: |
-          echo "::error::AI review ended with status '$STATUS'"
-          exit 1
+    # A uses: ref cannot be an expression; keep this on the ref callers use, as with shared_ref
+    uses: OpenC3/.github/.github/workflows/ai-review-run.yml@main
+    with:
+      pr_number: ${{ needs.pr.outputs.number }}
+      force: ${{ inputs.force }}
+      review_instructions: ${{ inputs.review_instructions }}
+      max_turns: ${{ inputs.max_turns }}
+      max_ci_rounds: ${{ inputs.max_ci_rounds }}
+      claude_model: ${{ inputs.claude_model }}
+      codex_model: ${{ inputs.codex_model }}
+      claude_max_budget_usd: ${{ inputs.claude_max_budget_usd }}
+      codex_sandbox: ${{ inputs.codex_sandbox }}
+      scan_workflow_name: ${{ inputs.scan_workflow_name }}
+      scan_status_context: ${{ inputs.scan_status_context }}
+      shared_ref: ${{ inputs.shared_ref }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      AI_REVIEW_PUSH_TOKEN: ${{ secrets.AI_REVIEW_PUSH_TOKEN }}

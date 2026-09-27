@@ -10,7 +10,9 @@
 #    GitHub substitutes it only when you start the workflow from the Actions tab; the
 #    literal matches no branch, which only adds skipped runs for pushes.
 # 3. Add ANTHROPIC_API_KEY and OPENAI_API_KEY to the repo (or org) secrets, and
-#    AI_REVIEW_PUSH_TOKEN (a token with contents:write) so the reviewers' fixes are pushed.
+#    AI_REVIEW_PUSH_TOKEN so the reviewers' fixes are pushed: a GitHub App token (or
+#    fine-grained PAT) with contents:write and no workflows permission, so GitHub refuses
+#    a push that changes a workflow.
 # 4. Optionally describe what to look for in review_instructions.
 #
 # Add the `skip-ai-review` label to a PR to opt out. Changes to this file take effect once
@@ -44,7 +46,7 @@ jobs:
     uses: OpenC3/.github/.github/workflows/ai-review-reusable.yml@main
     permissions:
       actions: read
-      contents: write
+      contents: read
       pull-requests: write
       statuses: read
     with:

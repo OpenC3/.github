@@ -87,6 +87,10 @@ jobs:
         # The fixtures need only Python's standard library, git, bash, and jq; no agents or network
         run: python3 -m unittest discover -s tests
 
+      # The image the review agents run in; catches a base image or package pin that no longer resolves
+      - name: Build the agent sandbox
+        run: docker build -q -t ai-review-agent ai-review/sandbox
+
   playwright-harness:
     name: Check Playwright harness
     runs-on: ubuntu-latest

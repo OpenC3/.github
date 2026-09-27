@@ -15,14 +15,18 @@ Run with: python3 -m unittest discover -s tests
 GitHub API calls are replaced by fixtures; no agents or network calls are made.
 """
 
+import http.client
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -35,12 +39,15 @@ CHECK_TRIGGERS = ROOT / "ai-review/check_triggers.py"
 # Imported only for its rules; keep bytecode out of the scanner directory
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(SCANNER.parent))
+sys.path.insert(0, str(ROOT / "ai-review"))
 import malicious_code_scan  # noqa: E402
+import patch_policy  # noqa: E402
 
 
 CONTEXT = "security/malicious-code-scan"
 SCAN_RUN_URL = "https://github.com/owner/repo/actions/runs/{}"
 BOT_MESSAGE = "fix(review): fix CI\n\nAI-Review-Bot: true\nAI-Review-Run: 456"
+BOT_IDENTITY = ("github-actions[bot]", "41898282+github-actions[bot]@users.noreply.github.com")
 
 
 def workflow_script(name):
@@ -76,20 +83,46 @@ if '--jq' in args:
 print(value if isinstance(value, str) else json.dumps(value))
 """
 
-# Stands in for both `claude` and `codex`: records its arguments and environment, runs the shell
-# snippet in $AGENT_ACTIONS/<name> once if present, and returns a schema-valid result carrying the
-# lines of $AGENT_ACTIONS/<name>.concerns as unresolved concerns.
+# Stands in for docker: records its arguments, and for `docker run` without -d (an agent turn) runs
+# the command on the host with only the container's environment, in its working directory. The
+# proxy (`docker run -d`) and the network commands do nothing.
+FAKE_DOCKER = """
+import json, os, subprocess, sys
+args = sys.argv[1:]
+with open(os.environ['DOCKER_LOG'], 'a') as output:
+    output.write(json.dumps(args) + '\\n')
+if args[0] != 'run' or '-d' in args:
+    sys.exit(0)
+with_value = {'--network', '--user', '--security-opt', '--tmpfs', '--pids-limit', '-e', '-v', '-w', '--cap-drop'}
+env, cwd, i = {}, None, 1
+while args[i].startswith('-'):
+    if args[i] in with_value:
+        value = args[i + 1]
+        if args[i] == '-e':
+            name, _, setting = value.partition('=')
+            env[name] = setting if '=' in value else os.environ.get(name, '')
+        elif args[i] == '-w':
+            cwd = value
+        i += 2
+    else:
+        i += 1
+command = args[i + 1:]
+# The fake agents and their test hooks, which a real container would not have
+host = {name: os.environ[name] for name in ('PATH', 'AGENT_LOG', 'AGENT_ACTIONS')}
+sys.exit(subprocess.run(command, env=host | env, cwd=cwd).returncode)
+"""
+
+# Stands in for both `claude` and `codex`: records its arguments, environment and the files it can
+# see, runs the shell snippet in $AGENT_ACTIONS/<name> once if present, and returns a schema-valid
+# result carrying the lines of $AGENT_ACTIONS/<name>.concerns as unresolved concerns.
 FAKE_AGENT = """
 import json, os, pathlib, subprocess, sys
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
-if name == 'codex' and args[0] in ('login', 'logout'):
-    if args[0] == 'login':
-        sys.stdin.read()
-    sys.exit(0)
 sys.stdin.read()
 with open(os.environ['AGENT_LOG'], 'a') as output:
-    output.write(json.dumps({'agent': name, 'args': args, 'env': dict(os.environ)}) + '\\n')
+    record = {'agent': name, 'args': args, 'env': dict(os.environ), 'files': sorted(os.listdir('.'))}
+    output.write(json.dumps(record) + '\\n')
 action = pathlib.Path(os.environ['AGENT_ACTIONS']) / name
 verdict = 'approved'
 if action.exists():
@@ -191,6 +224,7 @@ class ReviewTests(unittest.TestCase):
             "gh": FAKE_GH,
             "claude": FAKE_AGENT,
             "codex": FAKE_AGENT,
+            "docker": FAKE_DOCKER,
             "uv": f"import os, sys\nos.execv(sys.executable, [sys.executable, {str(SCANNER)!r}, *sys.argv[6:]])\n",
         }.items():
             command = self.directory / name
@@ -234,7 +268,7 @@ class ReviewTests(unittest.TestCase):
     def statuses(self):
         return self.fixtures["repos/owner/repo/commits/test-head/statuses"]
 
-    def run_loop(self, claude_action=None, codex_action=None, expect_calls=True):
+    def run_loop(self, claude_action=None, codex_action=None):
         repository = self.directory / "pr"
         repository.mkdir()
 
@@ -257,18 +291,17 @@ class ReviewTests(unittest.TestCase):
         for name, action in (("claude", claude_action), ("codex", codex_action)):
             if action:
                 (actions / name).write_text(action)
-        keys = self.directory / "keys"
-        keys.mkdir()
-        (keys / "claude").write_text(CLAUDE_KEY)
-        (keys / "codex").write_text(CODEX_KEY)
-        env = {key: value for key, value in self.env.items() if key not in ("CLAUDE_API_KEY", "CODEX_API_KEY")} | {
+        env = self.env | {
             "HOME": str(self.directory / "home"),
             "BASE_REF": "main",
-            "CLAUDE_KEY_FILE": str(keys / "claude"),
-            "CODEX_KEY_FILE": str(keys / "codex"),
+            "CLAUDE_API_KEY": CLAUDE_KEY,
+            "CODEX_API_KEY": CODEX_KEY,
+            "SANDBOX_IMAGE": "ai-review-agent",
             "MAX_TURNS": "4",
+            "RUNNER_TEMP": str(self.directory),
             "AGENT_LOG": str(self.directory / "agents.jsonl"),
             "AGENT_ACTIONS": str(actions),
+            "DOCKER_LOG": str(self.directory / "docker.jsonl"),
         }
         result = subprocess.run(
             ["bash", str(ROOT / "ai-review/ai_review_loop.sh")],
@@ -279,72 +312,77 @@ class ReviewTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(list(keys.iterdir()), [], "the key files must be deleted before the agents run")
         log = self.directory / "agents.jsonl"
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         new_commits = git("rev-list", "--count", f"{start}..HEAD")
-        return self.outputs(), calls, repository, new_commits
+        return self.loop_result(), calls, repository, new_commits
 
-    def test_loop_converges_and_each_agent_sees_only_its_own_key(self):
-        outputs, calls, repository, new_commits = self.run_loop(claude_action="echo fixed >> feature.py")
-        self.assertEqual(outputs["status"], "converged")
-        self.assertEqual(outputs["commits"], "1")
+    def loop_result(self):
+        result = self.directory / "out/result"
+        return {
+            "status": (result / "status").read_text().strip(),
+            "body": (result / "body.md").read_text(),
+            "patches": sorted(path.name for path in (result / "patches").iterdir()),
+        }
+
+    def docker_calls(self):
+        return [json.loads(line) for line in (self.directory / "docker.jsonl").read_text().splitlines()]
+
+    def test_loop_converges_and_agents_never_see_a_key(self):
+        result, calls, _, new_commits = self.run_loop(claude_action="echo fixed >> feature.py")
+        self.assertEqual(result["status"], "converged")
         self.assertEqual(new_commits, "1")
+        self.assertEqual(len(result["patches"]), 1)
+        self.assertEqual([call["agent"] for call in calls], ["claude", "codex"])
         for call in calls:
             values = "\n".join(call["env"].values())
-            other = CODEX_KEY if call["agent"] == "claude" else CLAUDE_KEY
-            self.assertNotIn(other, values)
-            self.assertEqual(call["env"]["GIT_CONFIG_KEY_0"], "core.hooksPath")
-        claude = next(call for call in calls if call["agent"] == "claude")
-        self.assertEqual(claude["env"]["ANTHROPIC_API_KEY"], CLAUDE_KEY)
+            self.assertNotIn(CLAUDE_KEY, values)
+            self.assertNotIn(CODEX_KEY, values)
+        claude = calls[0]
+        self.assertEqual(claude["env"]["ANTHROPIC_BASE_URL"].split(":")[0], "http")
         self.assertIn("--strict-mcp-config", claude["args"])
         self.assertEqual(claude["args"][claude["args"].index("--setting-sources") + 1], "user")
-        codex = next(call for call in calls if call["agent"] == "codex")
-        self.assertNotIn(CODEX_KEY, "\n".join(codex["env"].values()))
+        codex = calls[1]
+        self.assertIn("env_key", " ".join(codex["args"]))
 
-    def test_agents_get_a_fresh_home_and_no_runner_file_commands(self):
-        outputs, calls, _, _ = self.run_loop(claude_action="echo fixed >> feature.py")
-        self.assertEqual(outputs["status"], "converged")
-        homes = {call["env"]["HOME"] for call in calls}
-        self.assertNotIn(str(self.directory / "home"), homes)
-        self.assertFalse(any(Path(home).exists() for home in homes), "the agent HOME must be removed")
-        for call in calls:
-            self.assertNotIn("GITHUB_OUTPUT", call["env"])
-            self.assertEqual(call["env"]["GIT_CONFIG_GLOBAL"], "/dev/null")
-        claude = next(call for call in calls if call["agent"] == "claude")
-        denied = claude["args"][claude["args"].index("--disallowedTools") + 1 :]
-        self.assertIn("Bash(git *--output*)", denied)
-        self.assertIn("Edit(./.git/**)", denied)
-        self.assertIn("Write(./.git/**)", denied)
-
-    def test_planted_global_git_config_does_not_run(self):
-        # A clean filter written to the harness's own HOME (as `git log --output=` could) would run
-        # on the harness's `git add -A`
-        action = (
-            'mkdir -p "$AGENT_ACTIONS/../home" && printf \'[filter "x"]\\n  clean = touch %s\\n\' "$PWD/pwned"'
-            ' > "$AGENT_ACTIONS/../home/.gitconfig"'
-            " && echo '* filter=x' > .gitattributes && echo fixed >> feature.py"
-        )
-        outputs, _, repository, _ = self.run_loop(claude_action=action)
-        self.assertEqual(outputs["status"], "converged")
-        self.assertFalse((repository / "pwned").exists())
+    def test_agents_run_in_a_locked_down_container_behind_the_proxy(self):
+        self.run_loop(claude_action="echo fixed >> feature.py")
+        docker = self.docker_calls()
+        self.assertIn("--internal", next(call for call in docker if call[:2] == ["network", "create"]))
+        proxies = [call for call in docker if call[0] == "run" and "-d" in call]
+        agents = [call for call in docker if call[0] == "run" and "-d" not in call]
+        self.assertEqual(len(proxies), 2)
+        self.assertEqual(len(agents), 2)
+        for proxy in proxies:
+            # The key reaches the proxy through the environment, never the command line
+            self.assertNotIn(CLAUDE_KEY, json.dumps(proxy))
+            self.assertNotIn(CODEX_KEY, json.dumps(proxy))
+            self.assertIn("PROXY_API_KEY", proxy)
+        network = next(call for call in docker if call[:2] == ["network", "create"])[-1]
+        for agent in agents:
+            self.assertEqual(agent[agent.index("--network") + 1], network)
+            self.assertEqual(agent[agent.index("--cap-drop") + 1], "ALL")
+            self.assertIn("--read-only", agent)
+            mounts = [agent[i + 1] for i, arg in enumerate(agent) if arg == "-v"]
+            git_mounts = [mount for mount in mounts if mount.split(":")[1].endswith("/.git")]
+            self.assertEqual(len(git_mounts), 1)
+            self.assertTrue(git_mounts[0].endswith(":ro"), git_mounts)
+            self.assertFalse(any(mount.split(":")[0] == str(self.directory / "pr") for mount in mounts))
 
     def test_failed_turn_leaves_the_commit_reviewable(self):
-        outputs, _, _, _ = self.run_loop(codex_action="exit 1")
-        self.assertEqual(outputs["status"], "error")
-        comment = (self.directory / "out/comment.md").read_text()
-        self.assertTrue(comment.startswith("<!-- ai-adversarial-review -->"))
-        self.assertNotIn("ai-review-sha", comment)
+        result, _, _, _ = self.run_loop(codex_action="exit 1")
+        self.assertEqual(result["status"], "error")
+        self.assertTrue(result["body"].startswith("## AI adversarial review"))
+        self.assertNotIn("<!--", result["body"])
 
     def test_concerns_survive_a_failed_last_turn(self):
         # Claude raises a concern on turn 1, Codex fixes something on turn 2, Claude fails on turn 3
         (self.directory / "actions").mkdir()
         (self.directory / "actions/claude.concerns").write_text("needs a human decision\n")
         action = 'echo fixed >> feature.py && echo "exit 1" > "$AGENT_ACTIONS/claude"'
-        outputs, _, _, _ = self.run_loop(claude_action=action, codex_action="echo again >> feature.py")
-        self.assertEqual(outputs["status"], "error")
-        comment = (self.directory / "out/comment.md").read_text()
-        self.assertIn("### Open concerns for a human\n\n- needs a human decision", comment)
+        result, _, _, _ = self.run_loop(claude_action=action, codex_action="echo again >> feature.py")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("### Open concerns for a human\n\n- needs a human decision", result["body"])
 
     def test_turn_that_changes_ci_config_is_discarded(self):
         for path in (
@@ -355,11 +393,11 @@ class ReviewTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.setUp()
                 action = f'mkdir -p "$(dirname {path})" && echo "on: push" > {path}'
-                outputs, _, repository, new_commits = self.run_loop(codex_action=action)
-                self.assertEqual(outputs["status"], "error")
+                result, _, repository, new_commits = self.run_loop(codex_action=action)
+                self.assertEqual(result["status"], "error")
                 self.assertEqual(new_commits, "0")
                 self.assertFalse((repository / path).exists())
-                self.assertIn("CI workflows or actions", (self.directory / "out/comment.md").read_text())
+                self.assertIn("CI workflows or actions", result["body"])
 
     def test_turn_that_changes_agent_config_is_discarded(self):
         for path in (
@@ -375,54 +413,247 @@ class ReviewTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.setUp()
                 action = f'mkdir -p "$(dirname {path})" && echo "{{}}" > {path}'
-                outputs, _, repository, new_commits = self.run_loop(codex_action=action)
-                self.assertEqual(outputs["status"], "error")
-                self.assertEqual(outputs["commits"], "0")
+                result, _, repository, new_commits = self.run_loop(codex_action=action)
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(result["patches"], [])
                 self.assertEqual(new_commits, "0")
                 self.assertFalse((repository / path).exists())
-                self.assertIn("configure the AI agents", (self.directory / "out/comment.md").read_text())
+                self.assertIn("configure the AI agents", result["body"])
 
-    def test_turn_that_hides_agent_config_behind_gitignore_is_discarded(self):
-        outputs, _, repository, new_commits = self.run_loop(
-            claude_action="echo planted > AGENTS.md && echo AGENTS.md >> .gitignore"
-        )
-        self.assertEqual(outputs["status"], "error")
+    def test_turn_that_adds_a_symlink_is_discarded(self):
+        result, _, repository, new_commits = self.run_loop(claude_action="ln -s /etc/passwd link")
+        self.assertEqual(result["status"], "error")
         self.assertEqual(new_commits, "0")
+        self.assertFalse((repository / "link").is_symlink())
+        self.assertIn("symlink or submodule", result["body"])
+
+    def test_ignored_files_do_not_reach_the_next_agent(self):
+        result, calls, repository, _ = self.run_loop(
+            claude_action="echo planted > AGENTS.md && echo AGENTS.md >> .gitignore && echo fixed >> feature.py"
+        )
+        self.assertEqual(result["status"], "converged")
+        codex = next(call for call in calls if call["agent"] == "codex")
+        self.assertIn(".gitignore", codex["files"])
+        self.assertNotIn("AGENTS.md", codex["files"])
         self.assertFalse((repository / "AGENTS.md").exists())
-        self.assertIn("configure the AI agents", (self.directory / "out/comment.md").read_text())
 
-    def test_key_hidden_as_binary_is_not_committed(self):
-        for action in (
-            'printf "\\0%s\\n" "$ANTHROPIC_API_KEY" > leak.txt',
-            'echo "leak.txt -diff" > .gitattributes && echo "$ANTHROPIC_API_KEY" > leak.txt',
-        ):
-            with self.subTest(action=action):
-                self.setUp()
-                outputs, _, repository, new_commits = self.run_loop(claude_action=action)
-                self.assertEqual(outputs["status"], "error")
-                self.assertEqual(new_commits, "0")
-                self.assertFalse((repository / "leak.txt").exists())
-                self.assertIn("contained an API key", (self.directory / "out/comment.md").read_text())
+    def test_nested_git_directories_are_not_copied_back(self):
+        # A repository planted in the tree would have the harness's git run its config
+        action = (
+            'git init -q sub && git -C sub config core.fsmonitor "touch $PWD/pwned"'
+            " && echo kept > sub/file && echo fixed >> feature.py"
+        )
+        result, _, repository, new_commits = self.run_loop(claude_action=action)
+        self.assertEqual(result["status"], "converged")
+        self.assertEqual(new_commits, "1")
+        self.assertEqual((repository / "sub/file").read_text(), "kept\n")
+        self.assertFalse((repository / "sub/.git").exists())
+        self.assertFalse((repository / "pwned").exists())
 
-    def test_git_tampering_stops_the_run_without_pushing(self):
-        for action in (
-            "git config core.fsmonitor 'touch pwned'",
-            "mkdir -p .git/hooks && printf '#!/bin/sh\\ntouch pwned\\n' > .git/hooks/pre-commit"
-            " && chmod +x .git/hooks/pre-commit",
-            # git reads its config from wherever commondir points, which the snapshot would not see
-            "cp -R .git ../planted && git --git-dir=../planted config filter.x.clean 'touch pwned'"
-            " && echo '* filter=x' > .gitattributes && echo \"$PWD/../planted\" > .git/commondir",
+    def test_turn_that_leaves_a_fifo_is_discarded(self):
+        result, _, repository, new_commits = self.run_loop(claude_action="mkfifo pipe && echo fixed >> feature.py")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(new_commits, "0")
+        self.assertFalse((repository / "pipe").exists())
+        self.assertIn("could not be copied back", result["body"])
+
+    def make_publish_repo(self):
+        """A clone at the PR head, and a bare remote standing in for GitHub."""
+        remote = self.directory / "remote.git"
+        repository = self.directory / "publish"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+
+        def git(*args, **kwargs):
+            return subprocess.check_output(["git", *args], cwd=repository, text=True, **kwargs).strip()
+
+        git("config", "user.name", "Author")
+        git("config", "user.email", "author@example.invalid")
+        git("config", "commit.gpgsign", "false")
+        (repository / "feature.py").write_text("print(1)\n")
+        git("add", ".")
+        git("commit", "-q", "-m", "feature")
+        git("push", "-q", str(remote), "HEAD:refs/heads/feature")
+        return repository, remote, git, git("rev-parse", "HEAD")
+
+    def fix_patches(self, git, head, changes, author=BOT_IDENTITY, message=BOT_MESSAGE):
+        """Commits each change (a shell snippet) as the harness would, and exports them as patches."""
+        patches = self.directory / "result/patches"
+        patches.mkdir(parents=True, exist_ok=True)
+        name, email = author
+        for change in changes:
+            subprocess.run(["bash", "-c", change], cwd=self.directory / "publish", check=True)
+            git("add", "-A")
+            git("-c", f"user.name={name}", "-c", f"user.email={email}", "commit", "-q", "-m", message)
+        git("format-patch", "-q", "--binary", "-o", str(patches), f"{head}..HEAD")
+        git("reset", "-q", "--hard", head)
+
+    def publish(self, repository, remote, head, status="converged", body="## AI adversarial review\n", token="tok"):
+        result = self.directory / "result"
+        (result / "patches").mkdir(parents=True, exist_ok=True)
+        if status is not None:
+            (result / "status").write_text(status + "\n")
+        (result / "body.md").write_text(body)
+        url = f"https://x-access-token:{token}@github.com/owner/repo.git"
+        env = self.env | {
+            "RESULT_DIR": str(result),
+            "HEAD_SHA": head,
+            "HEAD_REF": "feature",
+            "COMMENT_FILE": str(self.directory / "comment.md"),
+            "PUSH_TOKEN": token,
+            "SECRETS": f"{token}\n{CLAUDE_KEY}\n",
+            # Send the push to the local remote instead of GitHub
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": f"url.{remote}.insteadOf",
+            "GIT_CONFIG_VALUE_0": url,
+        }
+        run = subprocess.run(
+            ["bash", str(ROOT / "ai-review/ai_review_publish.sh")],
+            env=env,
+            cwd=repository,
+            capture_output=True,
+            text=True,
+        )
+        pushed = subprocess.check_output(["git", "rev-parse", "feature"], cwd=remote, text=True).strip()
+        return run, self.outputs().get("status"), (self.directory / "comment.md").read_text(), pushed
+
+    def test_publish_pushes_the_harness_commits_and_marks_the_commit_reviewed(self):
+        repository, remote, git, head = self.make_publish_repo()
+        self.fix_patches(git, head, ["echo fixed >> feature.py", "echo more >> feature.py"])
+        run, status, comment, pushed = self.publish(repository, remote, head)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(status, "converged")
+        self.assertNotEqual(pushed, head)
+        self.assertEqual(
+            subprocess.check_output(["git", "rev-list", "--count", f"{head}..{pushed}"], cwd=remote, text=True).strip(),
+            "2",
+        )
+        self.assertTrue(comment.startswith(f"<!-- ai-adversarial-review -->\n<!-- ai-review-sha: {head} -->\n"))
+
+    def test_publish_refuses_fixes_the_policy_forbids(self):
+        for change, reason in (
+            ("mkdir -p .github/workflows && echo 'on: push' > .github/workflows/ci.yml", "CI workflows"),
+            ("echo planted > CLAUDE.md", "configure the AI agents"),
+            ("ln -s /etc/passwd link", "symlink or submodule"),
+            (f"echo {CLAUDE_KEY} >> feature.py", "secret"),
+            (f"printf '\\0%s' {CLAUDE_KEY} > blob.bin", "secret"),
         ):
-            with self.subTest(action=action):
+            with self.subTest(change=change):
                 self.setUp()
-                outputs, _, repository, _ = self.run_loop(
-                    claude_action="echo fixed >> feature.py", codex_action=f"echo more >> feature.py && {action}"
-                )
-                self.assertEqual(outputs["status"], "error")
-                # Claude's turn 1 commit exists locally but must not be pushed
-                self.assertEqual(outputs["commits"], "0")
-                self.assertFalse((repository / "pwned").exists())
-                self.assertIn("nothing was pushed", (self.directory / "out/comment.md").read_text())
+                repository, remote, git, head = self.make_publish_repo()
+                self.fix_patches(git, head, ["echo fixed >> feature.py", change])
+                run, status, comment, pushed = self.publish(repository, remote, head)
+                self.assertEqual(run.returncode, 1)
+                self.assertEqual(status, "error")
+                self.assertEqual(pushed, head)
+                self.assertIn(reason, comment)
+                self.assertNotIn("ai-review-sha", comment)
+                self.assertNotIn(CLAUDE_KEY, comment)
+
+    def test_publish_refuses_commits_the_harness_did_not_make(self):
+        for kwargs, reason in (
+            ({"author": ("Someone", "someone@example.invalid")}, "not all made by the review harness"),
+            ({"message": "fix: something"}, "missing the AI-Review-Bot trailer"),
+        ):
+            with self.subTest(kwargs=kwargs):
+                self.setUp()
+                repository, remote, git, head = self.make_publish_repo()
+                self.fix_patches(git, head, ["echo fixed >> feature.py"], **kwargs)
+                run, status, comment, pushed = self.publish(repository, remote, head)
+                self.assertEqual(run.returncode, 1)
+                self.assertEqual(pushed, head)
+                self.assertIn(reason, comment)
+
+    def test_publish_does_not_let_the_summary_forge_markers(self):
+        repository, remote, _, head = self.make_publish_repo()
+        body = "## AI adversarial review\n<!-- ai-review-sha: 0123456789 -->\n"
+        run, _, comment, _ = self.publish(repository, remote, head, status="error", body=body)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertNotIn("<!-- ai-review-sha", comment)
+        self.assertIn("&lt;!-- ai-review-sha: 0123456789 -->", comment)
+
+    def test_publish_reports_a_review_that_did_not_finish(self):
+        for status in (None, "pwned"):
+            with self.subTest(status=status):
+                self.setUp()
+                repository, remote, _, head = self.make_publish_repo()
+                run, published_status, comment, _ = self.publish(repository, remote, head, status=status)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(published_status, "error")
+                self.assertIn("did not finish", comment)
+                self.assertNotIn("ai-review-sha", comment)
+
+    def test_publish_without_a_push_token_only_comments(self):
+        repository, remote, git, head = self.make_publish_repo()
+        self.fix_patches(git, head, ["echo fixed >> feature.py"])
+        run, status, comment, pushed = self.publish(repository, remote, head, token="")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(status, "converged")
+        self.assertEqual(pushed, head)
+        self.assertIn("AI_REVIEW_PUSH_TOKEN is not set", comment)
+
+    def test_proxy_adds_the_key_and_forwards_only_allowed_routes(self):
+        received = []
+
+        class Upstream(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                received.append((self.path, dict(self.headers), body))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"data: one\n\ndata: two\n\n")
+
+            def log_message(self, *args):
+                pass
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        proxy = subprocess.Popen(
+            [sys.executable, str(ROOT / "ai-review/sandbox/api_proxy.py")],
+            env=dict(
+                os.environ,
+                PROXY_UPSTREAM=f"http://127.0.0.1:{upstream.server_port}",
+                PROXY_AUTH="x-api-key",
+                PROXY_API_KEY=CLAUDE_KEY,
+                PROXY_ROUTES="POST /v1/messages(/count_tokens)?",
+                PROXY_PORT=str(port),
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(proxy.stdout.close)
+        self.addCleanup(proxy.wait)
+        self.addCleanup(proxy.kill)
+        proxy.stdout.readline()
+
+        def request(method, path):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            headers = {"x-api-key": "placeholder", "Authorization": "Bearer placeholder"}
+            connection.request(method, path, body=b'{"model": "m"}', headers=headers)
+            response = connection.getresponse()
+            try:
+                return response.status, response.read()
+            finally:
+                connection.close()
+
+        status, body = request("POST", "/v1/messages?beta=true")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"data: one\n\ndata: two\n\n")
+        path, headers, sent = received[0]
+        self.assertEqual(path, "/v1/messages?beta=true")
+        self.assertEqual(headers["x-api-key"], CLAUDE_KEY)
+        self.assertNotIn("Authorization", headers)
+        self.assertEqual(sent, b'{"model": "m"}')
+        for method, path in (("POST", "/v1/files"), ("DELETE", "/v1/messages"), ("POST", "/v1/messages/../files")):
+            with self.subTest(method=method, path=path):
+                self.assertEqual(request(method, path)[0], 403)
+        self.assertEqual(len(received), 1)
 
     def test_carriage_return_does_not_hide_added_code(self):
         repository = self.directory / "repo"
@@ -588,9 +819,8 @@ class ReviewTests(unittest.TestCase):
         )
         self.assertNotIn("::warning", output)
 
-    def test_protected_paths_match_between_scanner_and_loop(self):
-        loop = (ROOT / "ai-review/ai_review_loop.sh").read_text()
-        pattern = "".join(re.findall(r"^AGENT_CONFIG_RE\+?='(.*)'$", loop, re.M))
+    def test_protected_paths_match_between_scanner_and_review(self):
+        self.assertEqual(patch_policy.AGENT_CONFIG_PATHS, malicious_code_scan.PROTECTED_PATHS)
         paths = [
             "CLAUDE.md",
             "CLAUDE.local.md",
@@ -608,15 +838,17 @@ class ReviewTests(unittest.TestCase):
             ".github/workflows/ai_review.yml",
             ".github/workflows/malicious-code-scan-reusable.yml",
             ".github/workflows/malicious_code_scan.yml",
+            ".github/workflows/ai-review-run.yml",
             ".github/workflows/python_lint.yml",
             "docs/ai-review.md",
             "src/claude.py",
         ]
         for path in paths:
             with self.subTest(path=path):
-                in_loop = subprocess.run(["grep", "-Eq", pattern], input=path, text=True).returncode == 0
+                in_review = patch_policy.violation("100644", "100644", path) is not None
                 in_scanner = any(r.search(path) for r in malicious_code_scan.PROTECTED_RE)
-                self.assertEqual(in_loop, in_scanner)
+                # The review also refuses every workflow change; the scanner only flags those
+                self.assertEqual(in_review, in_scanner or path.startswith(".github/workflows/"))
         self.assertFalse(any(r.search("docs/ai-review.md") for r in malicious_code_scan.PROTECTED_RE))
         self.assertTrue(any(r.search(".github/workflows/ai-review.yml") for r in malicious_code_scan.PROTECTED_RE))
         for path in ("AGENTS.override.md", "sub/CLAUDE.local.md"):
@@ -897,7 +1129,9 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(
             group, "${{ github.workflow }}-${{ needs.pr.outputs.number || github.event.workflow_run.head_sha }}"
         )
-        self.assertIn("PR_NUMBER: ${{ needs.pr.outputs.number }}", review)
+        self.assertIn("pr_number: ${{ needs.pr.outputs.number }}", review)
+        # The queue must cover the publish job too, so it has to be on the call of the whole review
+        self.assertIn("uses: OpenC3/.github/.github/workflows/ai-review-run.yml@", review)
 
 
 if __name__ == "__main__":

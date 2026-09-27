@@ -1,0 +1,344 @@
+# One AI review of one PR, called from ai-review-reusable.yml, which queues the
+# reviews of each PR so they run one at a time. Each stage gets its own runner
+# and only the permissions it needs, so what the agents can reach holds nothing
+# worth escaping their sandbox for:
+#
+#   gate    - decides whether to review and collects failed CI logs (read-only token)
+#   review  - Claude and Codex take turns in throwaway containers with no network
+#             but an API proxy holding the turn's key (ai-review/ai_review_loop.sh).
+#             The job's token can only read the repository, and the runner's own
+#             egress is limited to the endpoints the job needs.
+#   publish - on a fresh runner, checks the fix commits the review produced and
+#             pushes them, then posts the summary (ai-review/ai_review_publish.sh).
+#             It treats everything from the review job as untrusted data.
+#
+# Third party actions are pinned to a full commit SHA, because a tag can be moved
+# to point at different code. The comment after each pin records the tag it was.
+
+name: AI Review Run (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: PR to review; empty to look it up from the workflow_run head
+        required: false
+        type: string
+        default: ""
+      force:
+        required: false
+        type: boolean
+        default: false
+      review_instructions:
+        required: false
+        type: string
+        default: ""
+      max_turns:
+        required: false
+        type: string
+        default: ""
+      max_ci_rounds:
+        required: false
+        type: string
+        default: ""
+      claude_model:
+        required: false
+        type: string
+        default: ""
+      codex_model:
+        required: false
+        type: string
+        default: ""
+      claude_max_budget_usd:
+        required: false
+        type: string
+        default: ""
+      codex_sandbox:
+        required: false
+        type: string
+        default: ""
+      scan_workflow_name:
+        required: false
+        type: string
+        default: Malicious Code Scan
+      scan_status_context:
+        required: false
+        type: string
+        default: security/malicious-code-scan
+      shared_ref:
+        required: false
+        type: string
+        default: main
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      OPENAI_API_KEY:
+        required: true
+      AI_REVIEW_PUSH_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gate:
+    name: Wait for CI and collect failures
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: read
+    outputs:
+      skip: ${{ steps.gate.outputs.skip }}
+      pr: ${{ steps.gate.outputs.pr }}
+      head_sha: ${{ steps.gate.outputs.head_sha }}
+      head_ref: ${{ steps.gate.outputs.head_ref }}
+      base_ref: ${{ steps.gate.outputs.base_ref }}
+      ci_failures: ${{ steps.gate.outputs.ci_failures }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OpenC3/.github
+          ref: ${{ inputs.shared_ref }}
+          sparse-checkout: ai-review
+          path: shared
+          persist-credentials: false
+
+      # The caller's workflows as merged, to check its workflow_run list is complete
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/workflows
+          path: caller
+          persist-credentials: false
+
+      - name: Check the workflow_run list
+        continue-on-error: true
+        env:
+          # owner/repo/.github/workflows/<file>@<ref> of the caller
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          caller_file="${WORKFLOW_REF%@*}"
+          python3 shared/ai-review/check_triggers.py caller/.github/workflows "${caller_file##*/}"
+
+      - name: Wait for CI and collect failures
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          FORCE: ${{ inputs.force }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REVIEW_WORKFLOW: ${{ github.workflow }}
+          SCAN_WORKFLOW: ${{ inputs.scan_workflow_name }}
+          SCAN_CONTEXT: ${{ inputs.scan_status_context }}
+          MAX_CI_ROUNDS: ${{ inputs.max_ci_rounds || '3' }}
+          OUT_DIR: ${{ runner.temp }}/ai-review
+        run: bash shared/ai-review/ai_review_gate.sh
+
+      - name: Upload CI failures
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ai-review-ci-failures
+          path: ${{ runner.temp }}/ai-review/ci_failures.md
+          retention-days: 1
+          # A re-run of the job replaces the earlier attempt's
+          overwrite: true
+
+  review:
+    name: Review
+    needs: gate
+    if: needs.gate.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Read-only: the agents run on this runner, and a push happens only in the publish job
+    permissions:
+      contents: read
+    outputs:
+      stale: ${{ steps.fresh.outputs.stale }}
+    steps:
+      # The agents' containers can reach only the API proxy; this limits the runner itself, so even
+      # an agent that escaped its container could reach nothing but these
+      - name: Harden the runner (Block all but the needed outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.anthropic.com:443
+            api.openai.com:443
+            api.github.com:443
+            github.com:443
+            registry.npmjs.org:443
+            registry-1.docker.io:443
+            auth.docker.io:443
+            production.cloudflare.docker.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OpenC3/.github
+          ref: ${{ inputs.shared_ref }}
+          sparse-checkout: ai-review
+          path: shared
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.head_ref }}
+          path: repo
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the branch still matches the gated commit
+        id: fresh
+        working-directory: repo
+        env:
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
+            echo "Branch moved past $HEAD_SHA; the next CI completion will trigger a new review"
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download CI failures
+        if: steps.fresh.outputs.stale != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ai-review-ci-failures
+          path: ${{ runner.temp }}/ai-review-ci
+
+      - name: Build the agent sandbox
+        if: steps.fresh.outputs.stale != 'true'
+        run: docker build -q -t ai-review-agent shared/ai-review/sandbox
+
+      - name: Run review loop
+        if: steps.fresh.outputs.stale != 'true'
+        working-directory: repo
+        env:
+          BASE_REF: ${{ needs.gate.outputs.base_ref }}
+          # Only this step and the proxy containers it starts hold the keys; the agents never do
+          CLAUDE_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SANDBOX_IMAGE: ai-review-agent
+          MAX_TURNS: ${{ inputs.max_turns || '6' }}
+          CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-opus-5-5' }}
+          CODEX_MODEL: ${{ inputs.codex_model }}
+          CLAUDE_MAX_BUDGET_USD: ${{ inputs.claude_max_budget_usd || '5' }}
+          CODEX_SANDBOX: ${{ inputs.codex_sandbox || 'danger-full-access' }}
+          REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
+          OUT_DIR: ${{ runner.temp }}/ai-review
+          RESULT_DIR: ${{ runner.temp }}/ai-review-result
+          CI_FAILURES_FILE: ${{ runner.temp }}/ai-review-ci/ci_failures.md
+          CI_FAILURE_COUNT: ${{ needs.gate.outputs.ci_failures }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bash ../shared/ai-review/ai_review_loop.sh
+
+      - name: Upload the review result
+        if: always() && steps.fresh.outputs.stale != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ai-review-result
+          path: ${{ runner.temp }}/ai-review-result
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
+
+  publish:
+    name: Publish
+    needs: [gate, review]
+    # Also after a failed review, so the PR hears about it
+    if: >-
+      !cancelled() && needs.gate.outputs.skip == 'false' &&
+      needs.review.result != 'skipped' && needs.review.outputs.stale != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OpenC3/.github
+          ref: ${{ inputs.shared_ref }}
+          sparse-checkout: ai-review
+          path: shared
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.head_sha }}
+          path: repo
+          # Keep the push token out of .git/config
+          persist-credentials: false
+
+      # Missing if the review job failed before the loop finished; the publish step reports that
+      - name: Download the review result
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ai-review-result
+          path: ${{ runner.temp }}/ai-review-result
+
+      - name: Check and push fixes
+        id: publish
+        working-directory: repo
+        env:
+          RESULT_DIR: ${{ runner.temp }}/ai-review-result
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          HEAD_REF: ${{ needs.gate.outputs.head_ref }}
+          COMMENT_FILE: ${{ runner.temp }}/comment.md
+          PUSH_TOKEN: ${{ secrets.AI_REVIEW_PUSH_TOKEN }}
+          SECRETS: |
+            ${{ secrets.AI_REVIEW_PUSH_TOKEN }}
+            ${{ secrets.ANTHROPIC_API_KEY }}
+            ${{ secrets.OPENAI_API_KEY }}
+            ${{ github.token }}
+        run: bash ../shared/ai-review/ai_review_publish.sh
+
+      - name: Post review summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr }}
+          COMMENT_FILE: ${{ runner.temp }}/comment.md
+        run: |
+          if [[ ! -f "$COMMENT_FILE" ]]; then
+            echo "No summary was produced"
+            exit 0
+          fi
+          comment_id="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and .user.type == "Bot")
+              | select(.body | startswith("<!-- ai-adversarial-review -->")) | .id' | tail -n 1)"
+          if [[ -n "$comment_id" ]]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" -F "body=@${COMMENT_FILE}" > /dev/null
+          else
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$COMMENT_FILE"
+          fi
+
+      - name: Fail if the reviewers did not converge
+        if: steps.publish.outputs.status == 'error' || steps.publish.outputs.status == 'max_turns'
+        env:
+          STATUS: ${{ steps.publish.outputs.status }}
+        run: |
+          echo "::error::AI review ended with status '$STATUS'"
+          exit 1

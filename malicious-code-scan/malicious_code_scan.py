@@ -191,7 +191,7 @@ PUBLIC_IP_URL = re.compile(r"https?://((?:\d{1,3}\.){3}\d{1,3})")
 PRIVATE_IP = re.compile(r"^(127\.|10\.|0\.0\.0\.0|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)")
 
 # Files that steer the AI agents or this scanner, in the scanned repository or in OpenC3/.github
-# itself; a change needs a human. Keep in sync with AGENT_CONFIG_RE in ai_review_loop.sh.
+# itself; a change needs a human. Keep in sync with AGENT_CONFIG_PATHS in ai-review/patch_policy.py.
 PROTECTED_PATHS = [
     r"(^|/)CLAUDE(\.local)?\.md$",
     r"(^|/)AGENTS(\.override)?\.md$",
@@ -201,7 +201,7 @@ PROTECTED_PATHS = [
     r"(^|/)\.mcp\.json$",
     r"^\.github/copilot-instructions\.md$",
     r"^(ai-review|malicious-code-scan)/",
-    r"^\.github/workflows/(ai[-_]review|malicious[-_]code[-_]scan)(-reusable)?\.ya?ml$",
+    r"^\.github/workflows/(ai[-_]review|malicious[-_]code[-_]scan)(-reusable|-run)?\.ya?ml$",
 ]
 PROTECTED_RE = [re.compile(p) for p in PROTECTED_PATHS]
 # Files that run code at build/install/CI time
