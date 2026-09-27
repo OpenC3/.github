@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "issues_fixed", "unresolved_concerns"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["approved", "changes_made"],
+      "description": "approved if you found nothing worth changing, changes_made if you edited files"
+    },
+    "summary": {
+      "type": "string",
+      "description": "One or two sentences describing the overall state of the PR"
+    },
+    "issues_fixed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "One entry per issue you fixed, formatted as 'path:line - problem and fix'"
+    },
+    "unresolved_concerns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Real problems you could not or should not fix automatically (design questions, missing context)"
+    }
+  }
+}

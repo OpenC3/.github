@@ -55,6 +55,36 @@ jobs:
             fi
           done
 
+  ai-review:
+    name: Test AI review and malicious code scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.5"
+
+      - name: Lint Python
+        env:
+          RUFF_VERSION: 0.16.8
+        run: |
+          set -euo pipefail
+          uvx "ruff@${RUFF_VERSION}" check --output-format=github ai-review malicious-code-scan tests
+          uvx "ruff@${RUFF_VERSION}" format --check ai-review malicious-code-scan tests
+
+      - name: Lint shell
+        run: shellcheck ai-review/*.sh
+
+      - name: Test safeguards
+        # The fixtures need only Python's standard library, git, bash, and jq; no agents or network
+        run: python3 -m unittest discover -s tests
+
   playwright-harness:
     name: Check Playwright harness
     runs-on: ubuntu-latest

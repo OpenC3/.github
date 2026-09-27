@@ -1,0 +1,8 @@
+{
+    "name": "AI Review",
+    "description": "Claude and Codex take turns reviewing each pull request and fixing CI failures once CI finishes and the Malicious Code Scan passes.",
+    "iconName": "octicon code-review",
+    "categories": [
+        "Code review"
+    ]
+}

@@ -1,0 +1,43 @@
+# Scans every pull request for obfuscated code, prompt injection, and other
+# malicious changes, and gates the AI Review workflow on the result.
+# Copy this file to .github/workflows/ in the repo and:
+# 1. Add a Claude API key to the repo (or org) secrets as ANTHROPIC_API_KEY. Without it
+#    only the deterministic rules run, with a warning.
+# 2. Make the `security/malicious-code-scan` commit status a required check in branch protection.
+# 3. Create a `malicious-scan-override` label; a maintainer with write access adds it to
+#    accept blocking findings on a commit after reviewing them.
+# 4. If you also use ai-review.yml under a different file name, update review_workflow.
+#
+# This must stay on pull_request_target: the scan then runs from the default branch and this
+# repository, so a PR cannot change it. The PR is only ever read as data. The workflow name is
+# what ai-review.yml's scan_workflow_name expects; keep them in step if you rename it.
+
+name: Malicious Code Scan
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - ready_for_review
+      - labeled
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    uses: OpenC3/.github/.github/workflows/malicious-code-scan-reusable.yml@main
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
+      actions: write
+    with:
+      review_workflow: ai-review.yml  # Set to "" if the repo has no AI Review workflow
+      # project_description: "OpenC3 COSMOS plugin for ..."  # Uncomment to describe the repo to the Claude review
+      # claude_model: claude-opus-5-5  # Uncomment to use a different model
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

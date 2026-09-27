@@ -1,0 +1,8 @@
+{
+    "name": "Malicious Code Scan",
+    "description": "Scans pull requests for obfuscated code, prompt injection and other malicious changes, and gates the AI Review on the result.",
+    "iconName": "octicon shield",
+    "categories": [
+        "Security"
+    ]
+}
