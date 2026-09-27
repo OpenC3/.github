@@ -107,17 +107,53 @@ defaults:
     shell: bash
 
 jobs:
-  review:
+  # workflow_run.pull_requests can be empty, and a group keyed on anything else would let a CI
+  # trigger and a dispatch for the same PR review it at once; look the number up first
+  pr:
+    name: Find the PR
     if: >-
       github.event_name != 'workflow_run' ||
       (github.event.workflow_run.event == 'pull_request' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      number: ${{ steps.find.outputs.number }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Find the PR
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [[ -z "$PR_NUMBER" ]]; then
+            PR_NUMBER="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls" \
+              --jq '[.[] | select(.state == "open")][0].number // empty')"
+          fi
+          if [[ -n "$PR_NUMBER" && ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::pr_number must be a number, not '$PR_NUMBER'"
+            exit 1
+          fi
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+  review:
+    needs: pr
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     # One review per PR at a time; extra triggers queue and then exit in the gate. Keep every
     # pending run (default is one) so a manual `force` dispatch is not replaced by a CI trigger.
+    # Without a PR the gate skips; key on the commit so those runs do not queue behind each other.
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.event.workflow_run.head_branch }}
+      group: ${{ github.workflow }}-${{ needs.pr.outputs.number || github.event.workflow_run.head_sha }}
       cancel-in-progress: false
       queue: max
     permissions:
@@ -161,7 +197,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER: ${{ inputs.pr_number }}
+          PR_NUMBER: ${{ needs.pr.outputs.number }}
           FORCE: ${{ inputs.force }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           REVIEW_WORKFLOW: ${{ github.workflow }}
@@ -260,6 +296,10 @@ jobs:
           # Nor filters or diff drivers from a global or system config planted outside the checkout
           GIT_CONFIG_GLOBAL: /dev/null
           GIT_CONFIG_NOSYSTEM: "1"
+          # Nor a config reached through a planted .git/commondir
+          GIT_DIR: ${{ github.workspace }}/repo/.git
+          GIT_COMMON_DIR: ${{ github.workspace }}/repo/.git
+          GIT_WORK_TREE: ${{ github.workspace }}/repo
         run: |
           note() { printf '\n> [!WARNING]\n> %s\n' "$1" >> "$COMMENT_FILE"; }
           # The agents could read secrets on the runner; never publish a commit that contains one.

@@ -135,7 +135,12 @@ jobs:
       - name: Fetch PR commits
         working-directory: repo
         run: |
-          git fetch --no-tags --no-recurse-submodules origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
+          # The checkout kept no credentials, and a private repository needs them; pass the token to
+          # this fetch only
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" \
+            fetch --no-tags --no-recurse-submodules origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
           if [[ "$(git rev-parse refs/remotes/pr/head)" != "$HEAD_SHA" ]]; then
             echo "::error::PR head moved during the scan; the new push will be scanned by its own run"
             exit 1
@@ -199,7 +204,7 @@ jobs:
           METADATA_BLOCKING: ${{ steps.metadata.outputs.blocking }}
           METADATA_CHANGED: ${{ steps.metadata.outputs.changed }}
           STALE: ${{ steps.metadata.outputs.stale }}
-          BLOCKING: ${{ steps.scan.outputs.blocking }}
+          CODE_BLOCKING: ${{ steps.scan.outputs.code_blocking }}
           WARNINGS: ${{ steps.scan.outputs.warnings }}
           ACTION: ${{ github.event.action }}
           LABEL_NAME: ${{ github.event.label.name }}
@@ -213,18 +218,37 @@ jobs:
             echo "PR head moved; leaving the new commit to its own scan"
             exit 0
           fi
+          # Judge the PR text as it is now, not as this (possibly queued) event saw it, so a stale
+          # event cannot fail text the author already fixed
+          BLOCKING=$(( ${CODE_BLOCKING:-0} + ${METADATA_BLOCKING:-0} ))
           if [[ "$METADATA_ONLY" == "true" && "$SCAN_OUTCOME" == "success" && "$METADATA_OUTCOME" == "success" &&
-                "${BLOCKING:-0}" == "0" && "${METADATA_BLOCKING:-0}" == "0" ]]; then
+                "$BLOCKING" == "0" ]]; then
             echo "PR title/description are clean; keeping the existing scan result for ${HEAD_SHA}"
             exit 0
           fi
           remove_override_label() {
             gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/${OVERRIDE_LABEL}" > /dev/null || true
           }
+          # Prints the descriptions of this commit's statuses in the given state, newest first, that
+          # a run of this workflow posted. Any workflow with statuses: write, a PR's own included,
+          # can post the context, so each must link to a pull_request_target run (which comes from
+          # the default branch) of this workflow whose conclusion matches.
+          own_statuses() {
+            local want_state="$1" want_conclusion="$2" url description run info
+            local prefix="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/"
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" --paginate \
+              --jq ".[] | select(.context == \"$STATUS_CONTEXT\" and .state == \"$want_state\")
+                | [.target_url // \"-\", .description // \"\"] | @tsv" |
+              while IFS=$'\t' read -r url description; do
+                run="${url#"$prefix"}"
+                [[ "$url" == "$prefix"* && "$run" =~ ^[0-9]+$ ]] || continue
+                info="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run}" --jq '[.event, .name, .conclusion // "-"] | @tsv' || true)"
+                [[ "$info" == "pull_request_target"$'\t'"${GITHUB_WORKFLOW}"$'\t'"${want_conclusion}" ]] || continue
+                printf '%s\n' "${description:--}"
+              done
+          }
           # An earlier override of this exact commit survives rescans (e.g. a PR description edit)
-          prior_override="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" --paginate \
-            --jq ".[] | select(.context == \"$STATUS_CONTEXT\" and .state == \"success\" and (.description | startswith(\"Override\"))) | .description" \
-            | head -n 1)"
+          prior_override="$(own_statuses success success | grep '^Override' | head -n 1 || true)"
 
           if [[ "$SCAN_OUTCOME" != "success" || "$METADATA_OUTCOME" != "success" ]]; then
             # Fail closed: a scanner error is not a pass
@@ -245,8 +269,7 @@ jobs:
             permission="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${SENDER}/permission" --jq .permission 2> /dev/null || true)"
             # The label event carries whatever the head is now. Only accept it for a commit whose
             # blocking result the maintainer could have seen, not one pushed just before the label.
-            prior_failure="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" --paginate \
-              --jq ".[] | select(.context == \"$STATUS_CONTEXT\" and .state == \"failure\") | .id" | head -n 1)"
+            prior_failure="$(own_statuses failure failure | head -n 1 || true)"
             state=failure
             if [[ "$permission" != "admin" && "$permission" != "write" ]]; then
               description="Rejected override by @${SENDER} (needs write access); ${BLOCKING} blocking finding(s)"

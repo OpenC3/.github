@@ -44,6 +44,10 @@ export GIT_CONFIG_COUNT=2
 export GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
 export GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+# Pin the repository too: a .git/commondir file (read in any repository, not only worktrees) would
+# otherwise point git at a config outside .git that the snapshot below never sees
+REPO_TOP="$(git rev-parse --show-toplevel)"
+export GIT_DIR="$REPO_TOP/.git" GIT_COMMON_DIR="$REPO_TOP/.git" GIT_WORK_TREE="$REPO_TOP"
 
 # The runner reads these files after the step to set outputs, env and PATH for later steps, such as
 # the push that holds the push token. Hide their paths from the agents; outputs are written below.
@@ -92,7 +96,7 @@ CI_CONFIG_RE='^\.github/(workflows|actions)/'
 
 # Git config, hooks and alternates the agents could plant to run code the next time the harness
 # calls git. They are copied at the start and compared after every turn.
-GIT_CONTROL_PATHS=(config info hooks objects/info)
+GIT_CONTROL_PATHS=(config info hooks objects/info commondir)
 snapshot_git() {
   local dest="$1" path
   rm -rf "$dest"

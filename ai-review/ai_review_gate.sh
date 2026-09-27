@@ -74,7 +74,25 @@ fi
 HEAD_SHA="$pr_head"
 
 # Never hand a PR to agents holding secrets and a write token until the malicious code scan passes
-scan_state="$(gh api "repos/$repo/commits/$HEAD_SHA/status" --jq ".statuses[] | select(.context == \"$SCAN_CONTEXT\") | .state")"
+IFS=$'\t' read -r scan_state scan_url < <(gh api "repos/$repo/commits/$HEAD_SHA/status" \
+  --jq ".statuses[] | select(.context == \"$SCAN_CONTEXT\") | [.state, .target_url // \"\"] | @tsv") || true
+# Any workflow with statuses: write, a PR's own included, can post this status. Only accept one that
+# links to a pull_request_target run of the scan workflow, which comes from the default branch, and
+# that run has not failed. The run object for pull_request_target does not record the PR head, so
+# this cannot prove the run scanned this commit; the scan's pending status on each push covers that.
+if [[ "$scan_state" == "success" ]]; then
+  run_prefix="${GITHUB_SERVER_URL:-https://github.com}/$repo/actions/runs/"
+  scan_run="${scan_url#"$run_prefix"}"
+  scan_run_info=""
+  if [[ "$scan_url" == "$run_prefix"* && "$scan_run" =~ ^[0-9]+$ ]]; then
+    scan_run_info="$(gh api "repos/$repo/actions/runs/$scan_run" --jq '[.event, .name, .conclusion // ""] | @tsv' || true)"
+  fi
+  IFS=$'\t' read -r run_event run_name run_conclusion <<< "$scan_run_info"
+  if [[ "$run_event" != "pull_request_target" || "$run_name" != "$SCAN_WORKFLOW" ||
+    ! "$run_conclusion" =~ ^(success)?$ ]]; then
+    skip "the malicious code scan status on $HEAD_SHA was not posted by a passing $SCAN_WORKFLOW run"
+  fi
+fi
 case "$scan_state" in
   success) ;;
   "") skip "the malicious code scan has not reported on $HEAD_SHA" ;;

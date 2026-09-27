@@ -38,8 +38,10 @@ jobs:
           set -euo pipefail
           bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
           # The templates are workflows too, just ones GitHub copies into plugin
-          # repos rather than runs here
-          ./actionlint -color .github/workflows/*.yml workflow-templates/*.yml
+          # repos rather than runs here. actionlint does not know concurrency's
+          # `queue` key yet; drop the -ignore once a release supports it.
+          ./actionlint -color -ignore 'unexpected key "queue" for "concurrency" section' \
+            .github/workflows/*.yml workflow-templates/*.yml
 
       - name: Validate template metadata
         run: |

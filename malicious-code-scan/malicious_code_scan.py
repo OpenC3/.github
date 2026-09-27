@@ -33,7 +33,8 @@ with secrets. Findings are "block" (fails the check until a maintainer
 overrides) or "warn" (reported only).
 
 Writes GitHub annotations to stdout, a markdown report to --summary, and
-blocking/warnings counts to $GITHUB_OUTPUT.
+blocking, code_blocking (all but the PR title/body) and warnings counts to
+$GITHUB_OUTPUT.
 """
 
 from __future__ import annotations
@@ -413,7 +414,8 @@ def parse_added_lines(diff: str) -> dict[str, list[tuple[int, str]]]:
     return files
 
 
-def deterministic_scan(base: str, head: str, pr_title: str, pr_body: str) -> tuple[list[Finding], str]:
+def deterministic_scan(base: str, head: str) -> tuple[list[Finding], str]:
+    """Rules over the code and commit messages; the PR title and body are metadata_scan's."""
     findings: list[Finding] = []
     diff_args = ["--no-color", "--no-ext-diff", "--no-textconv", "-M", f"{base}...{head}"]
 
@@ -476,7 +478,6 @@ def deterministic_scan(base: str, head: str, pr_title: str, pr_body: str) -> tup
     # Metadata the AI agents read
     for i, text in enumerate(git("log", "--format=%B", f"{base}..{head}").splitlines(), 1):
         scan_text("(commit messages)", i, text, findings, code_rules=False)
-    findings += metadata_scan(pr_title, pr_body)
 
     excludes = [":(exclude)*.lock", ":(exclude)**/pnpm-lock.yaml", ":(exclude)docs/**", ":(exclude)**/*.min.*"]
     full_diff = git("diff", "--unified=5", *diff_args, "--", ".", *excludes)
@@ -750,14 +751,18 @@ def main() -> int:
     pr_title = os.environ.get("PR_TITLE", "")
     pr_body = os.environ.get("PR_BODY", "")
     summaries: list[str] = []
-    if args.metadata_only:
-        findings = dedupe(metadata_scan(pr_title, pr_body))
-    else:
+    # Kept apart so the workflow can combine the code result with a recheck of the current PR text,
+    # which may have changed since this event; deduped apart so neither can hide the other's findings
+    metadata = dedupe(metadata_scan(pr_title, pr_body))
+    code: list[Finding] = []
+    if not args.metadata_only:
         base = git("merge-base", args.base, args.head).strip()
-        findings, diff = deterministic_scan(base, args.head, pr_title, pr_body)
-    if not args.no_semantic and not args.metadata_only:
-        semantic, summaries = semantic_scan(diff, pr_title, pr_body, findings)
-        findings += semantic
+        code, diff = deterministic_scan(base, args.head)
+        if not args.no_semantic:
+            # Claude also reads the PR text, so its findings count as code findings
+            semantic, summaries = semantic_scan(diff, pr_title, pr_body, code + metadata)
+            code += semantic
+    findings = code + metadata
 
     for f in findings:
         annotate(f)
@@ -767,9 +772,10 @@ def main() -> int:
             json.dump([asdict(f) for f in findings], fh, indent=2)
 
     blocking = sum(f.severity == "block" for f in findings)
+    code_blocking = sum(f.severity == "block" for f in code)
     warnings = len(findings) - blocking
     with open(os.environ.get("GITHUB_OUTPUT", os.devnull), "a", encoding="utf-8") as fh:
-        fh.write(f"blocking={blocking}\nwarnings={warnings}\n")
+        fh.write(f"blocking={blocking}\ncode_blocking={code_blocking}\nwarnings={warnings}\n")
     print(f"{blocking} blocking finding(s), {warnings} warning(s)", file=sys.stderr)
     return 0
 
