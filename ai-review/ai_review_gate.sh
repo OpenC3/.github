@@ -109,9 +109,10 @@ esac
 runs="$(gh api "repos/$repo/actions/runs?head_sha=$HEAD_SHA&per_page=100" --paginate \
   --jq ".workflow_runs[] | select(.name != \"$REVIEW_WORKFLOW\" and .name != \"$SCAN_WORKFLOW\")" | jq -s .)"
 total="$(jq length <<< "$runs")"
-# Built-in (dynamic) runs such as CodeQL default setup may not trigger workflow_run, so waiting on
-# one that finishes last would never start the review; their failures are still collected below
-pending="$(jq '[.[] | select(.status != "completed" and .event != "dynamic")] | length' <<< "$runs")"
+# Only pull_request runs start this review when they finish (the pr job drops the rest), so waiting on
+# a push or built-in (dynamic, e.g. CodeQL default setup) run that finishes last would never start it.
+# Failures from every run are still collected below.
+pending="$(jq '[.[] | select(.status != "completed" and .event == "pull_request")] | length' <<< "$runs")"
 if (( total == 0 )) && [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
   skip "no CI runs found for $HEAD_SHA yet"
 fi

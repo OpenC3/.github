@@ -314,6 +314,8 @@ class ReviewTests(unittest.TestCase):
         claude = next(call for call in calls if call["agent"] == "claude")
         denied = claude["args"][claude["args"].index("--disallowedTools") + 1 :]
         self.assertIn("Bash(git *--output*)", denied)
+        self.assertIn("Edit(./.git/**)", denied)
+        self.assertIn("Write(./.git/**)", denied)
 
     def test_planted_global_git_config_does_not_run(self):
         # A clean filter written to the harness's own HOME (as `git log --output=` could) would run
@@ -532,6 +534,14 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(self.outputs()["skip"], "true")
         self.assertIn("still in progress", self.outputs()["reason"])
 
+    def test_pending_push_run_does_not_block_review(self):
+        # A push run's completion is dropped by the pr job, so waiting on it would never start the review
+        runs = self.fixtures["repos/owner/repo/actions/runs?head_sha=test-head&per_page=100"]["workflow_runs"]
+        runs.append({"id": 125, "name": "Python Lint", "event": "push", "status": "in_progress", "conclusion": None})
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "false")
+
     def check_triggers(self, workflows):
         directory = self.directory / "workflows"
         directory.mkdir()
@@ -612,40 +622,86 @@ class ReviewTests(unittest.TestCase):
         for path in ("AGENTS.override.md", "sub/CLAUDE.local.md"):
             self.assertTrue(any(r.search(path) for r in malicious_code_scan.PROTECTED_RE), path)
 
-    def test_generated_paths_match_the_claude_review_excludes(self):
+    def check_generated(self, paths, generated_paths=""):
         repository = self.directory / "generated"
-        paths = {
-            "docs/index.html": True,
-            "docs/assets/js/main.3f2a.js": True,
-            "docs/build/assets/js/runtime.9c1d.js": True,
-            "docs/assets/css/styles.css": True,
-            "docs/sitemap.xml": True,
-            "docs/assets/js/main.js.map": True,
-            "lib/vendor.min.js": True,
-            "vendor.min.css": True,
-            "docs/conf.py": False,
-            "docs/docusaurus.config.js": False,
-            "docs/scripts/build.sh": False,
-            "docs/scripts/build.js": False,
-            "docs/src/theme/Root.js": False,
-            "docs/js/custom.js": False,
-            "docs/fooassets/x.js": False,
-            "docs/src/theme/index.ts": False,
-            "docs/README.md": False,
-            "src/app.js": False,
-        }
         for path in paths:
             (repository / path).parent.mkdir(parents=True, exist_ok=True)
             (repository / path).write_text("x\n")
         subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
         subprocess.run(["git", "add", "."], cwd=repository, check=True)
+        malicious_code_scan.set_generated_paths(generated_paths)
+        self.addCleanup(malicious_code_scan.set_generated_paths, "")
         reviewed = subprocess.check_output(
             ["git", "ls-files", "--", ".", *malicious_code_scan.GENERATED_EXCLUDES], cwd=repository, text=True
         ).splitlines()
         for path, generated in paths.items():
             with self.subTest(path=path):
-                self.assertEqual(bool(malicious_code_scan.GENERATED_RE.search(path)), generated)
+                self.assertEqual(malicious_code_scan.is_generated(path), generated)
                 self.assertEqual(path not in reviewed, generated)
+
+    def test_only_minified_files_are_generated_by_default(self):
+        self.check_generated(
+            {
+                "lib/vendor.min.js": True,
+                "vendor.min.css": True,
+                "dist/app.min.mjs": True,
+                "public/js/app.js.map": True,
+                "docs/index.html": False,
+                "docs/assets/js/main.3f2a.js": False,
+                "docs/requirements.txt": False,
+                "docs/conf.py": False,
+                "src/app.js": False,
+            }
+        )
+
+    def test_generated_paths_match_the_claude_review_excludes(self):
+        self.check_generated(
+            {
+                "docs/index.html": True,
+                "docs/tools/index.html": True,
+                "docs/assets/js/main.3f2a.js": True,
+                "docs/assets/css/styles.css": True,
+                "site/build/app.js": True,
+                "site/build/deep/app.js": True,
+                "a/out/x.txt": True,
+                "out/x.txt": True,
+                "lib/vendor.min.js": True,
+                "docs/conf.py": False,
+                "docs/requirements.txt": False,
+                "docs/sitemap.xml": False,
+                "docs/scripts/build.js": False,
+                "docs/assetsx/x.js": False,
+                "site/buildx/app.js": False,
+                "site/build.js": False,
+                "src/app.js": False,
+            },
+            """
+            # Built docs site
+            docs/**/*.html
+            docs/assets/**
+            site/build/
+            **/out/*.txt
+            """,
+        )
+
+    def test_generated_paths_with_a_trailing_slash_match_the_excludes(self):
+        self.check_generated({"docs/index.html": True, "docs/a/b.css": True, "src/app.js": False}, "docs/**/")
+
+    def test_unsupported_generated_paths_are_refused(self):
+        for pattern in (
+            "/docs/**",
+            ":(literal)docs",
+            "docs/[ab].html",
+            "docs/a**.html",
+            "docs\\x",
+            "./docs/**",
+            "docs//**",
+            "docs/../src/**",
+            "docs/./x",
+            "/",
+        ):
+            with self.subTest(pattern=pattern), self.assertRaises(ValueError):
+                malicious_code_scan.set_generated_paths(pattern)
 
     def test_successful_bot_commit_is_still_skipped(self):
         self.fixtures["repos/owner/repo/actions/runs?head_sha=test-head&per_page=100"]["workflow_runs"][0][

@@ -194,7 +194,9 @@ validate_result() {
 run_claude() {
   local prompt_file="$1" result_file="$2" raw="$OUT_DIR/claude-raw-$3.json"
   # Project settings and MCP servers could come from the PR or an earlier agent turn and would run
-  # hooks outside any sandbox, so only the runner's own settings are loaded
+  # hooks outside any sandbox, so only the runner's own settings are loaded. Writes to .git are denied:
+  # a diff.external or textconv driver added to .git/config would run on Claude's own git diff, and
+  # the check that git is unchanged only runs after the turn
   HOME="$AGENT_HOME" ANTHROPIC_API_KEY="$CLAUDE_API_KEY" \
     claude -p \
       --model "$CLAUDE_MODEL" \
@@ -206,7 +208,8 @@ run_claude() {
       --permission-mode acceptEdits \
       --allowedTools "Read(./**)" "Edit(./**)" "Write(./**)" "Glob" "Grep" \
         "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(git status:*)" "Bash(git blame:*)" \
-      --disallowedTools "Read(~/.codex/**)" "Read(//proc/**)" "Bash(git diff --no-index:*)" \
+      --disallowedTools "Read(~/.codex/**)" "Read(//proc/**)" "Edit(./.git/**)" "Write(./.git/**)" \
+        "Bash(git diff --no-index:*)" \
         "Bash(git *--output*)" \
       < "$prompt_file" > "$raw" || return $?
   if jq -e '.is_error == true' "$raw" > /dev/null; then

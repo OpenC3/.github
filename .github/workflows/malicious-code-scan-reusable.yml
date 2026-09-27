@@ -45,6 +45,14 @@ on:
         required: false
         type: string
         default: ""
+      generated_paths:
+        description: >-
+          Committed build output, as git :(glob) patterns one per line (e.g. docs/assets/**), to check
+          only with high-signal rules and leave out of the Claude review; minified files always are.
+          Keep it narrow: a PR chooses its file paths, and nothing listed here should run in CI.
+        required: false
+        type: string
+        default: ""
       claude_model:
         description: Claude model for the semantic review (default claude-opus-5-5)
         required: false
@@ -159,6 +167,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SCAN_CLAUDE_MODEL: ${{ inputs.claude_model }}
           SCAN_PROJECT_DESCRIPTION: ${{ inputs.project_description }}
+          SCAN_GENERATED_PATHS: ${{ inputs.generated_paths }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           # Passed through env, never interpolated into the script: both are attacker-controlled
           PR_TITLE: ${{ github.event.pull_request.title }}

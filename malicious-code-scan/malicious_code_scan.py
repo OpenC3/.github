@@ -268,31 +268,65 @@ BINARY_MEDIA_EXTS = (
 BLOB_EXEMPT_RE = re.compile(r"\.(svg|map|snap|pem|crt|lock)$|(^|/)(pnpm-lock\.yaml|package-lock\.json)$")
 # Build output and vendored minified code: huge, machine-written, and full of patterns that are
 # normal there (zero-width anchors, base64 fonts, mixed scripts). Only rules that never fire
-# legitimately run on them, and they are left out of the Claude review. Under docs/ only built
-# site assets count, and JavaScript only inside an assets/ directory: scripts and config files
-# there (conf.py, docusaurus.config.js, scripts/build.js, src/theme/Root.js) run in CI and get
-# every rule. GENERATED_EXCLUDES must match the same paths (tests check).
-GENERATED_RE = re.compile(
-    r"\.min\.(js|css|mjs)$|\.(js|css)\.map$|^docs/(.+/)?[^/]+\.(html|css|map|xml|txt)$|^docs/(.+/)?assets/.+\.js$"
-)
+# legitimately run on them, and they are left out of the Claude review. Built in are only files
+# whose name says they are generated; a repository that commits other build output (e.g. a site
+# published from docs/) lists it with the generated_paths workflow input (--generated-paths).
+# Keep those lists narrow: anyone opening a PR chooses the file paths, and a script or config file
+# that runs in CI must get every rule. GENERATED_EXCLUDES must match the same paths (tests check).
+GENERATED_RE = re.compile(r"\.min\.(js|css|mjs)$|\.(js|css)\.map$")
 # git pathspecs without glob magic, where * also matches /
-GENERATED_EXCLUDES = [
-    f":(exclude){pattern}"
-    for pattern in (
-        "*.min.js",
-        "*.min.css",
-        "*.min.mjs",
-        "*.js.map",
-        "*.css.map",
-        "docs/*.html",
-        "docs/*.css",
-        "docs/*.map",
-        "docs/*.xml",
-        "docs/*.txt",
-        "docs/assets/*.js",
-        "docs/*/assets/*.js",
-    )
+BUILTIN_GENERATED_EXCLUDES = [
+    f":(exclude){pattern}" for pattern in ("*.min.js", "*.min.css", "*.min.mjs", "*.js.map", "*.css.map")
 ]
+GENERATED_EXCLUDES = list(BUILTIN_GENERATED_EXCLUDES)
+GENERATED_PATHS_RE: re.Pattern[str] | None = None
+
+
+def glob_regex(pattern: str) -> str:
+    """Translate a git :(glob) pathspec into a regex that matches the same file paths.
+
+    * and ? stay within one directory, a whole ** component matches any number of directories (at
+    the end, everything inside), and a pattern without wildcards also matches a directory's
+    contents. Character classes, escapes, other pathspec magic, absolute paths and the empty, . and
+    .. components git normalizes away (it reads ./docs//** as docs/**) are refused rather than half
+    supported. The caller strips a trailing /.
+    """
+    parts = pattern.split("/")
+    if pattern.startswith(":") or any(c in pattern for c in "[]\\") or any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"unsupported generated path {pattern!r}")
+    if not any(c in pattern for c in "*?"):
+        return re.escape(pattern) + "(/.*)?"
+    out = ""
+    for i, part in enumerate(parts):
+        last = i == len(parts) - 1
+        if part == "**":
+            out += ".*" if last else "(.*/)?"
+        elif "**" in part:
+            raise ValueError(f"unsupported generated path {pattern!r}: ** must be a whole path component")
+        else:
+            out += re.escape(part).replace(r"\*", "[^/]*").replace(r"\?", "[^/]") + ("" if last else "/")
+    return out
+
+
+def set_generated_paths(text: str) -> None:
+    """Treat files matching the git :(glob) patterns in text (one per line, # for comments) as generated."""
+    global GENERATED_PATHS_RE
+    # A trailing / is dropped for the exclude too: git's :(glob,exclude)docs/**/ excludes no files,
+    # so the regex and the exclude must both be built from the pattern without it
+    patterns = [
+        line.strip().rstrip("/") or line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    regexes = [glob_regex(p) for p in patterns]
+    GENERATED_PATHS_RE = re.compile("|".join(f"(?:{r})" for r in regexes)) if regexes else None
+    GENERATED_EXCLUDES[:] = [*BUILTIN_GENERATED_EXCLUDES, *(f":(glob,exclude){p}" for p in patterns)]
+
+
+def is_generated(path: str) -> bool:
+    return bool(GENERATED_RE.search(path) or (GENERATED_PATHS_RE and GENERATED_PATHS_RE.fullmatch(path)))
+
+
 GENERATED_RULES = {
     "bidi-control",
     "unicode-tag",
@@ -345,7 +379,7 @@ def printable(text: str) -> str:
 
 
 def scan_text(path: str, line_no: int, text: str, findings: list[Finding], code_rules: bool = True) -> None:
-    if GENERATED_RE.search(path):
+    if is_generated(path):
         found: list[Finding] = []
         _scan_text(path, line_no, text, found, code_rules)
         findings.extend(f for f in found if f.rule in GENERATED_RULES)
@@ -382,7 +416,7 @@ def _scan_text(path: str, line_no: int, text: str, findings: list[Finding], code
             continue
         if regex.search(text):
             findings.append(Finding(severity, rule, path, line_no, message, printable(text)))
-    if GENERATED_RE.search(path) and JS_DECODE_EXEC_DIRECT_RE.search(text):
+    if is_generated(path) and JS_DECODE_EXEC_DIRECT_RE.search(text):
         findings.append(
             Finding("block", "js-decode-exec-direct", path, line_no, "executes decoded data", printable(text))
         )
@@ -505,7 +539,7 @@ def deterministic_scan(base: str, head: str) -> tuple[list[Finding], str]:
         if "mode 120000" in line:
             findings.append(Finding("warn", "symlink", line.split()[-1], 0, "adds a symlink"))
 
-    generated = [p for p in git("diff", "--name-only", "-z", *diff_args).split("\0") if p and GENERATED_RE.search(p)]
+    generated = [p for p in git("diff", "--name-only", "-z", *diff_args).split("\0") if p and is_generated(p)]
     if generated:
         findings.append(
             Finding(
@@ -805,7 +839,17 @@ def main() -> int:
         action="store_true",
         help="only check the PR title and description (for edits that leave the code unchanged)",
     )
+    parser.add_argument(
+        "--generated-paths",
+        default=os.environ.get("SCAN_GENERATED_PATHS", ""),
+        help="git :(glob) patterns, one per line, of committed build output to check only with high-signal "
+        "rules and leave out of the Claude review (default $SCAN_GENERATED_PATHS)",
+    )
     args = parser.parse_args()
+    try:
+        set_generated_paths(args.generated_paths)
+    except ValueError as e:
+        parser.error(str(e))
 
     pr_title = os.environ.get("PR_TITLE", "")
     pr_body = os.environ.get("PR_BODY", "")

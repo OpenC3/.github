@@ -39,5 +39,10 @@ jobs:
       review_workflow: ai-review.yml  # Set to "" if the repo has no AI Review workflow
       # project_description: "OpenC3 COSMOS plugin for ..."  # Uncomment to describe the repo to the Claude review
       # claude_model: claude-opus-5-5  # Uncomment to use a different model
+      # Uncomment if the repo commits build output (e.g. a site published from docs/). Minified
+      # files are always handled; list only files nothing runs in CI, since a PR chooses its paths.
+      # generated_paths: |
+      #   docs/**/*.html
+      #   docs/assets/**
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
