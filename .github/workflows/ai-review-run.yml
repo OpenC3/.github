@@ -111,7 +111,9 @@ jobs:
         with:
           repository: OpenC3/.github
           ref: ${{ inputs.shared_ref }}
-          sparse-checkout: ai-review
+          sparse-checkout: |
+            ai-review
+            malicious-code-scan
           path: shared
           persist-credentials: false
 

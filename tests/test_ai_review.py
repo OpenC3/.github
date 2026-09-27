@@ -56,7 +56,7 @@ def workflow_script(name):
 
 
 FAKE_GH = """
-import json, os, pathlib, subprocess, sys
+import io, json, os, pathlib, subprocess, sys, zipfile
 args = sys.argv[1:]
 fixture_path = pathlib.Path(os.environ['REVIEW_TEST_FIXTURES'])
 fixtures = json.loads(fixture_path.read_text())
@@ -70,17 +70,26 @@ path = args[1]
 if path == 'repos/owner/repo/statuses/test-head':
     fields = dict(arg.split('=', 1) for arg in args if '=' in arg)
     history = fixtures['repos/owner/repo/commits/test-head/statuses']
-    history.insert(0, dict(fields, id=len(history) + 1))
+    status = dict(fields, id=max([s['id'] for s in history] + [1000]) + 1,
+                  created_at='2026-01-01T12:01:00Z')
+    history.insert(0, status)
     fixture_path.write_text(json.dumps(fixtures))
+    print(json.dumps(status))
     sys.exit(0)
 value = fixtures[path]
 if isinstance(value, dict) and value.get('test_api_error'):
     sys.exit(1)
+if isinstance(value, dict) and 'test_zip' in value:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as archive:
+        archive.writestr('malicious-scan-record.json', json.dumps(value['test_zip']))
+    sys.stdout.buffer.write(buffer.getvalue())
+    sys.exit(0)
 if '--jq' in args:
     result = subprocess.run(['jq', '-r', args[args.index('--jq') + 1]],
                             input=json.dumps(value), text=True)
     sys.exit(result.returncode)
-print(value if isinstance(value, str) else json.dumps(value))
+print(value if isinstance(value, str) else json.dumps([value] if '--slurp' in args else value))
 """
 
 # Stands in for docker: records its arguments, and for `docker run` without -d (an agent turn) runs
@@ -165,23 +174,35 @@ class ReviewTests(unittest.TestCase):
                 "body": "Clean description",
             },
             "repos/owner/repo/commits/test-head/status": {
-                "statuses": [{"context": CONTEXT, "state": "success", "target_url": SCAN_RUN_URL.format(77)}]
+                "statuses": [
+                    {
+                        "id": 771,
+                        "context": CONTEXT,
+                        "state": "success",
+                        "description": "No blocking findings",
+                        "created_at": "2026-01-01T11:59:00Z",
+                        "target_url": SCAN_RUN_URL.format(77),
+                    }
+                ]
             },
             # Runs that post scan statuses: a passing and a blocking scan, and a PR's own workflow
             "repos/owner/repo/actions/runs/77": {
                 "event": "pull_request_target",
                 "name": "Malicious Code Scan",
                 "conclusion": "success",
+                "run_attempt": 1,
             },
             "repos/owner/repo/actions/runs/78": {
                 "event": "pull_request_target",
                 "name": "Malicious Code Scan",
                 "conclusion": "failure",
+                "run_attempt": 1,
             },
             "repos/owner/repo/actions/runs/79": {
                 "event": "pull_request",
                 "name": "Malicious Code Scan",
                 "conclusion": "success",
+                "run_attempt": 1,
             },
             "repos/owner/repo/commits/test-head/statuses": [],
             "repos/owner/repo/issues/1/comments": [],
@@ -217,6 +238,7 @@ class ReviewTests(unittest.TestCase):
             FORCE="false",
             GITHUB_SERVER_URL="https://github.com",
             GITHUB_RUN_ID="123",
+            GITHUB_RUN_ATTEMPT="1",
             GITHUB_WORKFLOW="Malicious Code Scan",
             STATUS_CONTEXT=CONTEXT,
             GITHUB_STEP_SUMMARY=str(self.directory / "summary.md"),
@@ -224,7 +246,10 @@ class ReviewTests(unittest.TestCase):
             OVERRIDE_LABEL="malicious-scan-override",
             EVENT_PR_TITLE="Clean title",
             EVENT_PR_BODY="Clean description",
+            RUNNER_TEMP=str(self.directory),
+            SCAN_RECORD=str(SCANNER.parent / "scan_record.py"),
         )
+        self.add_scan_record(self.fixtures["repos/owner/repo/commits/test-head/status"]["statuses"][0])
         for name, code in {
             "gh": FAKE_GH,
             "claude": FAKE_AGENT,
@@ -268,7 +293,57 @@ class ReviewTests(unittest.TestCase):
             "METADATA_CHANGED": "",
             "STALE": "",
         }
-        return self.run_shell(workflow_script("Report result"), defaults | extra)
+        settings = defaults | extra
+        record_file = self.directory / "malicious-scan-record.json"
+        record_file.unlink(missing_ok=True)
+        result = self.run_shell(workflow_script("Report result"), settings)
+        if result.returncode or not record_file.exists():
+            return result
+        # Stand in for upload-artifact, then execute the two subsequent run steps with the
+        # workflow's conditions. The record is the actual file produced by Report result.
+        status = self.statuses()[0]
+        self.add_scan_record(status, **json.loads(record_file.read_text()))
+        if status["state"] == "success" and settings["METADATA_ONLY"] != "true":
+            dispatch = self.run_shell(workflow_script("Start AI Review"), settings)
+            self.assertEqual(dispatch.returncode, 0, dispatch.stderr)
+        final = self.run_shell(
+            workflow_script("Fail if the scan or record failed"),
+            {"STATE": status["state"], "RECORD_OUTCOME": "success"},
+        )
+        return subprocess.CompletedProcess(
+            result.args, final.returncode, result.stdout + final.stdout, result.stderr + final.stderr
+        )
+
+    def add_scan_record(self, status, **changes):
+        run_id = int(status["target_url"].rsplit("/", 1)[1])
+        record = {
+            "version": 1,
+            "repository": "owner/repo",
+            "pr": 1,
+            "head_sha": "test-head",
+            "run_id": run_id,
+            "run_attempt": 1,
+            "status_id": status["id"],
+            "state": status["state"],
+            "context": status["context"],
+            "description": status.get("description"),
+            "created_at": status.get("created_at"),
+            **changes,
+        }
+        artifacts = self.fixtures.setdefault(
+            f"repos/owner/repo/actions/runs/{run_id}/artifacts?per_page=100", {"artifacts": []}
+        )["artifacts"]
+        artifact_id = status["id"]
+        artifacts.append(
+            {
+                "id": artifact_id,
+                "name": f"malicious-scan-status-{status['id']}",
+                "expired": False,
+                "workflow_run": {"id": run_id},
+            }
+        )
+        self.fixtures[f"repos/owner/repo/actions/artifacts/{artifact_id}/zip"] = {"test_zip": record}
+        return record
 
     def statuses(self):
         return self.fixtures["repos/owner/repo/commits/test-head/statuses"]
@@ -1053,6 +1128,7 @@ class ReviewTests(unittest.TestCase):
                 "created_at": "2026-01-01T11:59:00Z",
             }
         ]
+        self.add_scan_record(self.statuses()[0])
         result = self.report(
             ACTION="labeled",
             LABEL_NAME="malicious-scan-override",
@@ -1076,6 +1152,7 @@ class ReviewTests(unittest.TestCase):
                 "created_at": "2026-01-01T12:00:30Z",
             }
         ]
+        self.add_scan_record(self.statuses()[0])
         result = self.report(
             ACTION="labeled",
             LABEL_NAME="malicious-scan-override",
@@ -1123,7 +1200,7 @@ class ReviewTests(unittest.TestCase):
                 result = self.run_shell(f'bash "{GATE}"')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.outputs()["skip"], "true")
-                self.assertIn("not posted by a passing", self.outputs()["reason"])
+                self.assertIn("no verified record", self.outputs()["reason"])
 
     def test_gate_only_accepts_an_unfinished_scan_run_from_its_dispatch(self):
         # The scan dispatches the review before its own run concludes; a status forged while the
@@ -1132,18 +1209,150 @@ class ReviewTests(unittest.TestCase):
             "event": "pull_request_target",
             "name": "Malicious Code Scan",
             "conclusion": None,
+            "run_attempt": 1,
         }
         self.fixtures["repos/owner/repo/commits/test-head/status"]["statuses"][0]["target_url"] = SCAN_RUN_URL.format(
             80
         )
+        self.add_scan_record(self.fixtures["repos/owner/repo/commits/test-head/status"]["statuses"][0])
         result = self.run_shell(f'bash "{GATE}"')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs()["skip"], "true")
-        self.assertIn("not posted by a passing", self.outputs()["reason"])
+        self.assertIn("no verified record", self.outputs()["reason"])
         self.outputs_path.unlink()
         result = self.run_shell(f'bash "{GATE}"', {"EVENT_NAME": "workflow_dispatch"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs()["skip"], "false")
+
+    def test_gate_rejects_forged_success_pointing_at_a_passing_scan(self):
+        # A status writer copies every field and the URL of an old passing run. GitHub assigns
+        # the forgery a different ID, which that run's artifact cannot attest.
+        status = self.fixtures["repos/owner/repo/commits/test-head/status"]["statuses"][0]
+        status["id"] = 772
+        for event in ("workflow_run", "workflow_dispatch"):
+            with self.subTest(event=event):
+                result = self.run_shell(f'bash "{GATE}"', {"EVENT_NAME": event})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.outputs()["skip"], "true")
+                self.assertIn("no verified record", self.outputs()["reason"])
+
+    def test_gate_rejects_a_record_for_another_pr_commit_or_status(self):
+        original = dict(self.fixtures["repos/owner/repo/actions/artifacts/771/zip"]["test_zip"])
+        for field, value in (
+            ("repository", "other/repo"),
+            ("pr", 2),
+            ("head_sha", "older-head"),
+            ("status_id", 770),
+            ("state", "failure"),
+            ("context", "other-context"),
+            ("run_id", 76),
+            ("description", "Override by @forged"),
+            ("created_at", "2025-01-01T00:00:00Z"),
+        ):
+            with self.subTest(field=field):
+                self.fixtures["repos/owner/repo/actions/artifacts/771/zip"]["test_zip"] = original | {field: value}
+                result = self.run_shell(f'bash "{GATE}"')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.outputs()["skip"], "true")
+
+    def test_gate_fails_closed_when_record_cannot_be_read(self):
+        listing = "repos/owner/repo/actions/runs/77/artifacts?per_page=100"
+        artifact = self.fixtures[listing]["artifacts"][0]
+        for artifacts in ([], [artifact | {"expired": True}], [artifact | {"workflow_run": {"id": 79}}]):
+            with self.subTest(artifacts=artifacts):
+                self.fixtures[listing] = {"artifacts": artifacts}
+                result = self.run_shell(f'bash "{GATE}"', {"EVENT_NAME": "workflow_dispatch"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.outputs()["skip"], "true")
+        self.fixtures[listing] = {"artifacts": [artifact]}
+        self.fixtures["repos/owner/repo/actions/artifacts/771/zip"] = {"test_api_error": True}
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "true")
+
+    def test_gate_verifies_the_attempt_that_issued_the_status(self):
+        run_path = "repos/owner/repo/actions/runs/77"
+        self.fixtures[run_path + "/attempts/1"] = dict(self.fixtures[run_path])
+        self.fixtures[run_path].update(run_attempt=2, conclusion=None)
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "false")
+        self.fixtures[run_path + "/attempts/1"]["conclusion"] = "failure"
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "true")
+
+    def test_scan_rejects_forged_overrides_and_failures_linked_to_trusted_runs(self):
+        self.fixtures["repos/owner/repo/commits/test-head/statuses"] = [
+            {
+                "id": 772,
+                "context": CONTEXT,
+                "state": "success",
+                "description": "Override by @forged",
+                "target_url": SCAN_RUN_URL.format(77),
+                "created_at": "2026-01-01T11:59:00Z",
+            },
+            {
+                "id": 782,
+                "context": CONTEXT,
+                "state": "failure",
+                "description": "1 blocking finding(s)",
+                "target_url": SCAN_RUN_URL.format(78),
+                "created_at": "2026-01-01T11:59:00Z",
+            },
+        ]
+        result = self.report(HAS_OVERRIDE="true", CODE_BLOCKING="1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.statuses()[0]["state"], "failure")
+        result = self.report(
+            ACTION="labeled", LABEL_NAME="malicious-scan-override", HAS_OVERRIDE="true", CODE_BLOCKING="1"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("not reported as blocked before the label", self.statuses()[0]["description"])
+
+    def test_verified_override_survives_a_rescan(self):
+        status = {
+            "id": 773,
+            "context": CONTEXT,
+            "state": "success",
+            "description": "Override by @maintainer",
+            "target_url": SCAN_RUN_URL.format(77),
+            "created_at": "2026-01-01T11:59:00Z",
+        }
+        self.fixtures["repos/owner/repo/commits/test-head/statuses"] = [status]
+        self.add_scan_record(status)
+        result = self.report(HAS_OVERRIDE="true", CODE_BLOCKING="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.statuses()[0]["description"], "Override by @maintainer")
+
+    def test_report_records_github_status_identity_before_dispatch(self):
+        result = self.report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads((self.directory / "malicious-scan-record.json").read_text())
+        self.assertEqual(record["status_id"], self.statuses()[0]["id"])
+        self.assertEqual(record["pr"], 1)
+        self.assertEqual(record["head_sha"], "test-head")
+        self.assertEqual(record["repository"], "owner/repo")
+        self.assertEqual(record["run_id"], 123)
+        self.assertEqual(record["run_attempt"], 1)
+        self.assertLess(WORKFLOW.index("- name: Upload scan record"), WORKFLOW.index("- name: Start AI Review"))
+        dispatch = WORKFLOW.split("- name: Start AI Review", 1)[1].split("        env:", 1)[0]
+        self.assertIn("steps.record.outcome == 'success'", dispatch)
+        # The gate must accept the exact record produced by the workflow, not just our fixtures.
+        self.fixtures["repos/owner/repo/commits/test-head/status"]["statuses"] = [self.statuses()[0]]
+        self.fixtures["repos/owner/repo/actions/runs/123"].update(
+            event="pull_request_target", name="Malicious Code Scan", conclusion="success", run_attempt=1
+        )
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "false")
+
+    def test_failed_record_upload_invalidates_a_successful_status(self):
+        result = self.run_shell(
+            workflow_script("Fail if the scan or record failed"), {"STATE": "success", "RECORD_OUTCOME": "failure"}
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.statuses()[0]["state"], "error")
 
     def test_forged_scan_statuses_are_not_trusted(self):
         # A PR's own workflow posts a failure (to enable an override) and an override success

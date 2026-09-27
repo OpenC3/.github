@@ -7,6 +7,8 @@
 # 3. Create a `malicious-scan-override` label; a maintainer with write access adds it to
 #    accept blocking findings on a commit after reviewing them.
 # 4. If you also use ai-review.yml under a different file name, update review_workflow.
+# Scan results and overrides require the scan's stored artifact. Re-run the scan if its
+# record has expired or the result predates scan records; old status URLs alone are not trusted.
 #
 # This must stay on pull_request_target: the scan then runs from the default branch and this
 # repository, so a PR cannot change it. The PR is only ever read as data. The workflow name is

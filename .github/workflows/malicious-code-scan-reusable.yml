@@ -102,6 +102,7 @@ jobs:
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       METADATA_ONLY: ${{ github.event.action == 'edited' && !github.event.changes.base }}
       SCANNER: ${{ github.workspace }}/shared/malicious-code-scan/malicious_code_scan.py
+      SCAN_RECORD: ${{ github.workspace }}/shared/malicious-code-scan/scan_record.py
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
@@ -209,6 +210,7 @@ jobs:
             --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Report result
+        id: report
         if: always()
         env:
           SCAN_OUTCOME: ${{ steps.scan.outcome }}
@@ -222,8 +224,6 @@ jobs:
           LABEL_NAME: ${{ github.event.label.name }}
           SENDER: ${{ github.event.sender.login }}
           HAS_OVERRIDE: ${{ steps.metadata.outputs.has_override }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
         run: |
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           if [[ "$STALE" == "true" ]]; then
@@ -241,14 +241,11 @@ jobs:
           remove_override_label() {
             gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/${OVERRIDE_LABEL}" > /dev/null || true
           }
-          # Prints the descriptions of this commit's statuses in the given state, newest first, that
-          # a run of this workflow posted. Any workflow with statuses: write, a PR's own included,
-          # can post the context, so each must link to a pull_request_target run (which comes from
-          # the default branch) of this workflow whose conclusion matches. An optional third argument
-          # (an ISO 8601 UTC time) keeps only statuses posted before it.
+          # Status IDs must be recorded in artifacts from the trusted scan run. A URL pointing at
+          # that run, or an "Override" description, is not evidence that it issued the status.
+          # An optional second argument keeps only statuses posted before the label event.
           own_statuses() {
-            local want_state="$1" want_conclusion="$2" before="${3:-}" url description run info
-            local prefix="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/"
+            local want_state="$1" before="${2:-}" status
             local time_filter=""
             if [[ -n "$before" ]]; then
               [[ "$before" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 0
@@ -256,17 +253,14 @@ jobs:
             fi
             gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" --paginate \
               --jq ".[] | select(.context == \"$STATUS_CONTEXT\" and .state == \"$want_state\"${time_filter})
-                | [.target_url // \"-\", .description // \"\"] | @tsv" |
-              while IFS=$'\t' read -r url description; do
-                run="${url#"$prefix"}"
-                [[ "$url" == "$prefix"* && "$run" =~ ^[0-9]+$ ]] || continue
-                info="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run}" --jq '[.event, .name, .conclusion // "-"] | @tsv' || true)"
-                [[ "$info" == "pull_request_target"$'\t'"${GITHUB_WORKFLOW}"$'\t'"${want_conclusion}" ]] || continue
-                printf '%s\n' "${description:--}"
+                | tojson" |
+              while IFS= read -r status; do
+                python3 "$SCAN_RECORD" --workflow "$GITHUB_WORKFLOW" --pr "$PR_NUMBER" \
+                  --head "$HEAD_SHA" --context "$STATUS_CONTEXT" --state "$want_state" <<< "$status" || true
               done
           }
           # An earlier override of this exact commit survives rescans (e.g. a PR description edit)
-          prior_override="$(own_statuses success success | grep '^Override' | head -n 1 || true)"
+          prior_override="$(own_statuses success | grep '^Override' | head -n 1 || true)"
 
           if [[ "$SCAN_OUTCOME" != "success" || "$METADATA_OUTCOME" != "success" ]]; then
             # Fail closed: a scanner error is not a pass
@@ -292,7 +286,7 @@ jobs:
             label_time="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at || true)"
             prior_failure=""
             if [[ -n "$label_time" ]]; then
-              prior_failure="$(own_statuses failure failure "$label_time" | head -n 1 || true)"
+              prior_failure="$(own_statuses failure "$label_time" | head -n 1 || true)"
             fi
             state=failure
             if [[ "$permission" != "admin" && "$permission" != "write" ]]; then
@@ -324,15 +318,52 @@ jobs:
 
           echo "Result: $state - $description"
           gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" -f state="$state" -f context="$STATUS_CONTEXT" \
-            -f description="${description:0:140}" -f target_url="$run_url" > /dev/null
+            -f description="${description:0:140}" -f target_url="$run_url" > "${RUNNER_TEMP}/malicious-scan-status.json"
+          # Record the ID returned by GitHub, never an ID supplied by a PR or a status lookup.
+          jq --arg repository "$GITHUB_REPOSITORY" --argjson pr "$PR_NUMBER" --arg head "$HEAD_SHA" \
+            --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            '{version: 1, repository: $repository, pr: $pr, head_sha: $head, run_id: $run,
+              run_attempt: $attempt, status_id: .id, state: .state, context: .context,
+              description: .description, created_at: .created_at}' \
+            "${RUNNER_TEMP}/malicious-scan-status.json" > "${RUNNER_TEMP}/malicious-scan-record.json"
+          echo "status_id=$(jq -er '.status_id' "${RUNNER_TEMP}/malicious-scan-record.json")" >> "$GITHUB_OUTPUT"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
 
-          if [[ "$state" == "success" && "$METADATA_ONLY" != "true" ]]; then
-            # AI Review waits for this scan; start it in case the rest of CI already finished.
-            # Fails harmlessly when the repository has no AI Review workflow yet.
-            if [[ -n "$REVIEW_WORKFLOW" ]]; then
-              gh workflow run "$REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f pr_number="$PR_NUMBER" \
-                || echo "::warning::Could not start AI Review"
-            fi
-          elif [[ "$state" != "success" ]]; then
+      # Upload even a blocking result, so a later maintainer override can verify it. Artifacts are
+      # scoped to this trusted run and immutable. Each new status (including reruns) gets its own.
+      - name: Upload scan record
+        id: record
+        if: always() && steps.report.outputs.status_id != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: malicious-scan-status-${{ steps.report.outputs.status_id }}
+          path: ${{ runner.temp }}/malicious-scan-record.json
+          if-no-files-found: error
+
+      - name: Start AI Review
+        if: steps.record.outcome == 'success' && steps.report.outputs.state == 'success' && env.METADATA_ONLY != 'true'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
+        run: |
+          # The gate can now authenticate the status even before this run concludes.
+          if [[ -n "$REVIEW_WORKFLOW" ]]; then
+            gh workflow run "$REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f pr_number="$PR_NUMBER" \
+              || echo "::warning::Could not start AI Review"
+          fi
+
+      - name: Fail if the scan or record failed
+        if: always() && steps.report.outputs.state != ''
+        env:
+          STATE: ${{ steps.report.outputs.state }}
+          RECORD_OUTCOME: ${{ steps.record.outcome }}
+        run: |
+          if [[ "$RECORD_OUTCOME" != "success" ]]; then
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" -f state=error -f context="$STATUS_CONTEXT" \
+              -f description="Scan record upload failed; re-run the job" \
+              -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > /dev/null
+            exit 1
+          fi
+          if [[ "$STATE" != "success" ]]; then
             exit 1
           fi

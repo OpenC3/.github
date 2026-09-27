@@ -74,28 +74,20 @@ fi
 HEAD_SHA="$pr_head"
 
 # Never hand a PR to agents holding secrets and a write token until the malicious code scan passes
-IFS=$'\t' read -r scan_state scan_url < <(gh api "repos/$repo/commits/$HEAD_SHA/status" \
-  --jq ".statuses[] | select(.context == \"$SCAN_CONTEXT\") | [.state, .target_url // \"\"] | @tsv") || true
-# Any workflow with statuses: write, a PR's own included, can post this status. Only accept one that
-# links to a pull_request_target run of the scan workflow, which comes from the default branch, and
-# that run has not failed. The run object for pull_request_target does not record the PR head, so
-# this cannot prove the run scanned this commit; the scan's pending status on each push covers that.
+scan_status="$(gh api "repos/$repo/commits/$HEAD_SHA/status" --paginate \
+  --jq ".statuses[] | select(.context == \"$SCAN_CONTEXT\")" | jq -s '.[0] // {}')"
+scan_state="$(jq -r '.state // ""' <<< "$scan_status")"
+# Status URLs are caller-controlled. Require the trusted scan run's artifact to attest the exact
+# status ID, PR and head, so pointing a forged status at an old passing run cannot authorize review.
 if [[ "$scan_state" == "success" ]]; then
-  run_prefix="${GITHUB_SERVER_URL:-https://github.com}/$repo/actions/runs/"
-  scan_run="${scan_url#"$run_prefix"}"
-  scan_run_info=""
-  if [[ "$scan_url" == "$run_prefix"* && "$scan_run" =~ ^[0-9]+$ ]]; then
-    scan_run_info="$(gh api "repos/$repo/actions/runs/$scan_run" --jq '[.event, .name, .conclusion // ""] | @tsv' || true)"
-  fi
-  IFS=$'\t' read -r run_event run_name run_conclusion <<< "$scan_run_info"
-  # The scan dispatches this review before its own run finishes, so only that dispatch may accept a
-  # run with no conclusion yet. Otherwise a status forged while the real scan is still running, and
-  # pointed at that run, would start the review on a commit the scan may still block.
-  allowed_conclusion="^success$"
-  [[ "$EVENT_NAME" == "workflow_dispatch" ]] && allowed_conclusion="^(success)?$"
-  if [[ "$run_event" != "pull_request_target" || "$run_name" != "$SCAN_WORKFLOW" ||
-    ! "$run_conclusion" =~ $allowed_conclusion ]]; then
-    skip "the malicious code scan status on $HEAD_SHA was not posted by a passing $SCAN_WORKFLOW run"
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  allow_running=()
+  # The scan uploads its record before dispatching review, then concludes.
+  [[ "$EVENT_NAME" == "workflow_dispatch" ]] && allow_running=(--allow-running)
+  if ! python3 "$script_dir/../malicious-code-scan/scan_record.py" \
+    --workflow "$SCAN_WORKFLOW" --pr "$PR_NUMBER" --head "$HEAD_SHA" --context "$SCAN_CONTEXT" \
+    --state success ${allow_running[@]+"${allow_running[@]}"} <<< "$scan_status" > /dev/null; then
+    skip "the malicious code scan status on $HEAD_SHA has no verified record from a passing $SCAN_WORKFLOW run"
   fi
 fi
 case "$scan_state" in
