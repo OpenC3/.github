@@ -197,6 +197,8 @@ class ReviewTests(unittest.TestCase):
                 ]
             },
             "repos/owner/repo/actions/runs/123/jobs": {"jobs": []},
+            # This run, for the report step; created when its event (e.g. a label) fired
+            "repos/owner/repo/actions/runs/123": {"created_at": "2026-01-01T12:00:00Z"},
             "repos/owner/repo/commits/test-head": {"commit": {"message": BOT_MESSAGE}},
             "repos/owner/repo/pulls/1/commits": [{"commit": {"message": BOT_MESSAGE}}],
             "repos/owner/repo/collaborators/author/permission": {"permission": "write"},
@@ -1020,6 +1022,7 @@ class ReviewTests(unittest.TestCase):
                 "state": "failure",
                 "description": "1 blocking finding(s)",
                 "target_url": SCAN_RUN_URL.format(78),
+                "created_at": "2026-01-01T11:59:00Z",
             }
         ]
         result = self.report(
@@ -1031,6 +1034,31 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.statuses()[0]["state"], "success")
         self.assertIn("Override by @author", self.statuses()[0]["description"])
+
+    def test_override_cannot_accept_a_commit_blocked_after_the_label(self):
+        # A push just before the label: the label run queues behind that commit's scan, which
+        # posts its failure first, but the maintainer never saw that result
+        self.fixtures["repos/owner/repo/commits/test-head/statuses"] = [
+            {
+                "id": 1,
+                "context": CONTEXT,
+                "state": "failure",
+                "description": "1 blocking finding(s)",
+                "target_url": SCAN_RUN_URL.format(78),
+                "created_at": "2026-01-01T12:00:30Z",
+            }
+        ]
+        result = self.report(
+            ACTION="labeled",
+            LABEL_NAME="malicious-scan-override",
+            HAS_OVERRIDE="true",
+            CODE_BLOCKING="1",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.statuses()[0]["state"], "failure")
+        self.assertIn("not reported as blocked before the label", self.statuses()[0]["description"])
+        self.assertIn('"DELETE"', self.calls_path.read_text())
+        self.assertNotIn('"workflow"', self.calls_path.read_text())
 
     def test_clean_full_scan_dispatches_review(self):
         result = self.report()
@@ -1105,13 +1133,14 @@ class ReviewTests(unittest.TestCase):
                 "state": "failure",
                 "description": "1 blocking",
                 "target_url": SCAN_RUN_URL.format(79),
+                "created_at": "2026-01-01T11:59:00Z",
             },
         ]
         result = self.report(
             ACTION="labeled", LABEL_NAME="malicious-scan-override", HAS_OVERRIDE="true", CODE_BLOCKING="1"
         )
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("had not been reported as blocked", self.statuses()[0]["description"])
+        self.assertIn("not reported as blocked before the label", self.statuses()[0]["description"])
         result = self.report(HAS_OVERRIDE="true", CODE_BLOCKING="1")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(self.statuses()[0]["state"], "failure")

@@ -45,7 +45,9 @@ notes=()
 failed=0
 
 status=""
-[[ -f "$RESULT_DIR/status" ]] && read -r status < "$RESULT_DIR/status" || true
+if [[ -f "$RESULT_DIR/status" ]]; then
+  read -r status < "$RESULT_DIR/status" || true
+fi
 case "$status" in
   converged | max_turns | error) ;;
   *)

@@ -113,7 +113,9 @@ start_watchdog() {
   watchdog_pid=$!
 }
 stop_watchdog() {
-  [[ -n "$watchdog_pid" ]] && kill "$watchdog_pid" 2> /dev/null || true
+  if [[ -n "$watchdog_pid" ]]; then
+    kill "$watchdog_pid" 2> /dev/null || true
+  fi
   watchdog_pid=""
 }
 trap cleanup EXIT

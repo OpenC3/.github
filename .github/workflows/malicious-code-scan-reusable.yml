@@ -244,12 +244,18 @@ jobs:
           # Prints the descriptions of this commit's statuses in the given state, newest first, that
           # a run of this workflow posted. Any workflow with statuses: write, a PR's own included,
           # can post the context, so each must link to a pull_request_target run (which comes from
-          # the default branch) of this workflow whose conclusion matches.
+          # the default branch) of this workflow whose conclusion matches. An optional third argument
+          # (an ISO 8601 UTC time) keeps only statuses posted before it.
           own_statuses() {
-            local want_state="$1" want_conclusion="$2" url description run info
+            local want_state="$1" want_conclusion="$2" before="${3:-}" url description run info
             local prefix="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/"
+            local time_filter=""
+            if [[ -n "$before" ]]; then
+              [[ "$before" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 0
+              time_filter=" and .created_at != null and .created_at < \"$before\""
+            fi
             gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" --paginate \
-              --jq ".[] | select(.context == \"$STATUS_CONTEXT\" and .state == \"$want_state\")
+              --jq ".[] | select(.context == \"$STATUS_CONTEXT\" and .state == \"$want_state\"${time_filter})
                 | [.target_url // \"-\", .description // \"\"] | @tsv" |
               while IFS=$'\t' read -r url description; do
                 run="${url#"$prefix"}"
@@ -281,13 +287,19 @@ jobs:
             permission="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${SENDER}/permission" --jq .permission 2> /dev/null || true)"
             # The label event carries whatever the head is now. Only accept it for a commit whose
             # blocking result the maintainer could have seen, not one pushed just before the label.
-            prior_failure="$(own_statuses failure failure | head -n 1 || true)"
+            # This run may have queued behind that commit's scan, so the failure must also predate
+            # the label: a run's created_at is when its event fired, even for a queued run or a re-run.
+            label_time="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at || true)"
+            prior_failure=""
+            if [[ -n "$label_time" ]]; then
+              prior_failure="$(own_statuses failure failure "$label_time" | head -n 1 || true)"
+            fi
             state=failure
             if [[ "$permission" != "admin" && "$permission" != "write" ]]; then
               description="Rejected override by @${SENDER} (needs write access); ${BLOCKING} blocking finding(s)"
               remove_override_label
             elif [[ -z "$prior_failure" ]]; then
-              description="Rejected override: ${HEAD_SHA:0:7} had not been reported as blocked yet; review it and relabel"
+              description="Rejected override: ${HEAD_SHA:0:7} was not reported as blocked before the label; review it and relabel"
               remove_override_label
             else
               state=success
