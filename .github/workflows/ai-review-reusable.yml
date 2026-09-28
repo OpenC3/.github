@@ -8,8 +8,9 @@
 #
 # Called from workflow-templates/ai-review.yml, which a repository copies in and
 # triggers on workflow_run (once per completed CI workflow) and on
-# workflow_dispatch (which the scan uses when it passes). The gate lets only the
-# run that sees everything finished go ahead. workflow_run only uses the
+# workflow_dispatch (by hand). The gate lets only the run that sees all CI
+# finished go ahead, and waits there for a Malicious Code Scan still running.
+# The scan does not start the review itself. workflow_run only uses the
 # caller's copy on its default branch, and the scripts and prompt come from this
 # repository, so a PR cannot change how it is reviewed.
 #
@@ -25,7 +26,8 @@
 #                           PR could not merge until someone pushed again.
 #
 # The caller must grant the job actions: read, contents: read, pull-requests: write and
-# statuses: read. Add the `skip-ai-review` label to a PR to opt out.
+# statuses: read. Add the `skip-ai-review` label to a PR to opt out. A manual run
+# fails when it cannot review, so it is not mistaken for a review that passed.
 #
 # Third party actions are pinned to a full commit SHA, because a tag can be moved
 # to point at different code. The comment after each pin records the tag it was.
@@ -81,10 +83,15 @@ on:
         type: string
         default: ""
       scan_workflow_name:
-        description: Name of the caller's Malicious Code Scan workflow, which the gate does not wait on
+        description: Name of the caller's Malicious Code Scan workflow, which the gate waits on through its status instead of as CI
         required: false
         type: string
         default: Malicious Code Scan
+      scan_wait_minutes:
+        description: How long the gate waits for a scan still running on the PR head once CI is done (default 10)
+        required: false
+        type: string
+        default: ""
       scan_status_context:
         description: Commit status the Malicious Code Scan reports, which must be success
         required: false
@@ -179,6 +186,7 @@ jobs:
       claude_max_budget_usd: ${{ inputs.claude_max_budget_usd }}
       codex_sandbox: ${{ inputs.codex_sandbox }}
       scan_workflow_name: ${{ inputs.scan_workflow_name }}
+      scan_wait_minutes: ${{ inputs.scan_wait_minutes }}
       scan_status_context: ${{ inputs.scan_status_context }}
       shared_ref: ${{ inputs.shared_ref }}
     secrets:

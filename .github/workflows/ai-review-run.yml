@@ -61,6 +61,10 @@ on:
         required: false
         type: string
         default: Malicious Code Scan
+      scan_wait_minutes:
+        required: false
+        type: string
+        default: ""
       scan_status_context:
         required: false
         type: string
@@ -88,7 +92,8 @@ jobs:
   gate:
     name: Wait for CI and collect failures
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Leaves room for the wait on the scan (SCAN_WAIT_MINUTES) and collecting CI logs
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
@@ -145,6 +150,7 @@ jobs:
           REVIEW_WORKFLOW: ${{ github.workflow }}
           SCAN_WORKFLOW: ${{ inputs.scan_workflow_name }}
           SCAN_CONTEXT: ${{ inputs.scan_status_context }}
+          SCAN_WAIT_MINUTES: ${{ inputs.scan_wait_minutes || '10' }}
           MAX_CI_ROUNDS: ${{ inputs.max_ci_rounds || '3' }}
           OUT_DIR: ${{ runner.temp }}/ai-review
         run: bash shared/ai-review/ai_review_gate.sh
@@ -187,6 +193,7 @@ jobs:
             registry-1.docker.io:443
             auth.docker.io:443
             production.cloudflare.docker.com:443
+            production.cloudfront.docker.com:443
             results-receiver.actions.githubusercontent.com:443
             *.blob.core.windows.net:443
 

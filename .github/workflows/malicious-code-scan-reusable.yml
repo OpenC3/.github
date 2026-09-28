@@ -1,6 +1,7 @@
 # Scans a PR for obfuscated code, prompt injection, and other malicious changes
-# (see malicious-code-scan/malicious_code_scan.py), and gates the AI Review
-# workflow on the result.
+# (see malicious-code-scan/malicious_code_scan.py). The scan knows nothing of
+# the AI Review workflow and never starts it: the review waits for this scan's
+# status and checks its record itself before reviewing.
 #
 # Called from workflow-templates/malicious-code-scan.yml on pull_request_target,
 # so the caller comes from the default branch and the scanner from this
@@ -8,6 +9,10 @@
 # Claude review too. That is only safe because the PR is never checked out or
 # executed here -- its commits are fetched and read with git diff as data. Do
 # not add steps that run code from the PR.
+#
+# It can also be run by hand (workflow_dispatch with pr_number), e.g. for a PR
+# opened before the scan was set up or whose record has expired. Only a run from
+# the default branch is accepted, so the caller is still the merged copy.
 #
 # The result is posted as the commit status `security/malicious-code-scan` on
 # the PR head; make that a required check in branch protection.
@@ -25,7 +30,7 @@
 # Secrets: ANTHROPIC_API_KEY (the Claude review is skipped with a warning without it)
 #
 # The caller must grant the job contents: read, statuses: write, pull-requests: write and
-# actions: write.
+# actions: read.
 #
 # Third party actions are pinned to a full commit SHA, because a tag can be moved
 # to point at different code. The comment after each pin records the tag it was.
@@ -35,11 +40,11 @@ name: Malicious Code Scan (Reusable)
 on:
   workflow_call:
     inputs:
-      review_workflow:
-        description: File name of the caller's AI Review workflow to start when the scan passes; empty for none
+      pr_number:
+        description: PR to scan (from the caller's workflow_dispatch); empty for pull_request_target
         required: false
         type: string
-        default: ai-review.yml
+        default: ""
       project_description:
         description: What the repository is, for the Claude review (default names the repository)
         required: false
@@ -88,18 +93,17 @@ jobs:
     # Queue pending runs too: a description edit must not replace a queued full scan.
     # Keep this on the job so unrelated labels do not enter the queue.
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number }}
       cancel-in-progress: false
       queue: max
     permissions:
       contents: read
       statuses: write # report the result on the PR head commit
       pull-requests: write # remove a stale override label
-      actions: write # start AI Review once the scan passes
+      actions: read # read earlier scans' records, to verify an override
+    # PR_NUMBER, HEAD_SHA, BASE_SHA and PR_FILE (the PR as JSON) are set by "Find the PR"
     env:
       GH_TOKEN: ${{ github.token }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       METADATA_ONLY: ${{ github.event.action == 'edited' && !github.event.changes.base }}
       SCANNER: ${{ github.workspace }}/shared/malicious-code-scan/malicious_code_scan.py
       SCAN_RECORD: ${{ github.workspace }}/shared/malicious-code-scan/scan_record.py
@@ -110,11 +114,48 @@ jobs:
           egress-policy: audit
 
       - name: Check the trigger
-        # Under pull_request the caller would come from the PR, which could skip the scan
-        if: github.event_name != 'pull_request_target'
+        # Under pull_request, or dispatched from another branch, the caller would come from the PR,
+        # which could skip the scan
+        if: >-
+          github.event_name != 'pull_request_target' &&
+          (github.event_name != 'workflow_dispatch' ||
+           github.ref != format('refs/heads/{0}', github.event.repository.default_branch))
         run: |
-          echo "::error::Call this workflow on pull_request_target"
+          echo "::error::Call this workflow on pull_request_target, or on workflow_dispatch from the default branch"
           exit 1
+
+      - name: Find the PR
+        env:
+          PR_INPUT: ${{ inputs.pr_number }}
+        run: |
+          PR_FILE="${RUNNER_TEMP}/malicious-scan-pr.json"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ ! "$PR_INPUT" =~ ^[0-9]+$ ]]; then
+              echo "::error::pr_number must be a PR number, not '$PR_INPUT'"
+              exit 1
+            fi
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_INPUT}" > "$PR_FILE"
+            if [[ "$(jq -r '.state' "$PR_FILE")" != "open" ]]; then
+              echo "::error::PR #${PR_INPUT} is not open"
+              exit 1
+            fi
+          else
+            jq '.pull_request' "$GITHUB_EVENT_PATH" > "$PR_FILE"
+          fi
+          number="$(jq -r '.number' "$PR_FILE")"
+          head="$(jq -r '.head.sha' "$PR_FILE")"
+          base="$(jq -r '.base.sha' "$PR_FILE")"
+          if [[ ! "$number" =~ ^[0-9]+$ || ! "$head" =~ ^[0-9a-f]{40,64}$ || ! "$base" =~ ^[0-9a-f]{40,64}$ ]]; then
+            echo "::error::Could not read the PR number and commits"
+            exit 1
+          fi
+          echo "Scanning PR #${number} at ${head}"
+          {
+            echo "PR_FILE=$PR_FILE"
+            echo "PR_NUMBER=$number"
+            echo "HEAD_SHA=$head"
+            echo "BASE_SHA=$base"
+          } >> "$GITHUB_ENV"
 
       - name: Mark scan pending
         # A metadata-only recheck leaves the full scan's result in place unless it finds something
@@ -169,11 +210,14 @@ jobs:
           SCAN_CLAUDE_MODEL: ${{ inputs.claude_model }}
           SCAN_PROJECT_DESCRIPTION: ${{ inputs.project_description }}
           SCAN_GENERATED_PATHS: ${{ inputs.generated_paths }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          # Passed through env, never interpolated into the script: both are attacker-controlled
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
+          # Read from the event (or, dispatched, the API) and passed through env, never interpolated
+          # into the script: both are attacker-controlled. jq -j and the x sentinel keep trailing newlines.
+          PR_TITLE="$(jq -j '.title' "$PR_FILE"; printf x)"
+          PR_TITLE="${PR_TITLE%x}"
+          PR_BODY="$(jq -j '.body // ""' "$PR_FILE"; printf x)"
+          PR_BODY="${PR_BODY%x}"
+          export PR_TITLE PR_BODY
           mode=()
           [[ "$METADATA_ONLY" == "true" ]] && mode=(--metadata-only)
           uv run --script --locked --no-build "$SCANNER" \
@@ -184,9 +228,6 @@ jobs:
         id: metadata
         if: steps.scan.outcome == 'success'
         working-directory: repo
-        env:
-          EVENT_PR_TITLE: ${{ github.event.pull_request.title }}
-          EVENT_PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           # Events can queue out of order, and the text can change during a full scan.
           # Check the current text before publishing, and do not reuse an override for new text.
@@ -195,7 +236,11 @@ jobs:
             echo "stale=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # jq -j and the x sentinel keep trailing newlines, which the event text also keeps
+          # jq -j and the x sentinel keep trailing newlines
+          EVENT_PR_TITLE="$(jq -j '.title' "$PR_FILE"; printf x)"
+          EVENT_PR_TITLE="${EVENT_PR_TITLE%x}"
+          EVENT_PR_BODY="$(jq -j '.body // ""' "$PR_FILE"; printf x)"
+          EVENT_PR_BODY="${EVENT_PR_BODY%x}"
           PR_TITLE="$(jq -j '.title' <<< "$pr"; printf x)"
           PR_TITLE="${PR_TITLE%x}"
           PR_BODY="$(jq -j '.body // ""' <<< "$pr"; printf x)"
@@ -211,7 +256,8 @@ jobs:
 
       - name: Report result
         id: report
-        if: always()
+        # Nothing to report on without a PR head
+        if: always() && env.HEAD_SHA != ''
         env:
           SCAN_OUTCOME: ${{ steps.scan.outcome }}
           METADATA_OUTCOME: ${{ steps.metadata.outcome }}
@@ -329,8 +375,9 @@ jobs:
           echo "status_id=$(jq -er '.status_id' "${RUNNER_TEMP}/malicious-scan-record.json")" >> "$GITHUB_OUTPUT"
           echo "state=$state" >> "$GITHUB_OUTPUT"
 
-      # Upload even a blocking result, so a later maintainer override can verify it. Artifacts are
-      # scoped to this trusted run and immutable. Each new status (including reruns) gets its own.
+      # Upload even a blocking result, so a later maintainer override can verify it, and AI Review
+      # can verify a pass. Artifacts are scoped to this trusted run and immutable. Each new status
+      # (including reruns) gets its own.
       - name: Upload scan record
         id: record
         if: always() && steps.report.outputs.status_id != ''
@@ -339,18 +386,6 @@ jobs:
           name: malicious-scan-status-${{ steps.report.outputs.status_id }}
           path: ${{ runner.temp }}/malicious-scan-record.json
           if-no-files-found: error
-
-      - name: Start AI Review
-        if: steps.record.outcome == 'success' && steps.report.outputs.state == 'success' && env.METADATA_ONLY != 'true'
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
-        run: |
-          # The gate can now authenticate the status even before this run concludes.
-          if [[ -n "$REVIEW_WORKFLOW" ]]; then
-            gh workflow run "$REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f pr_number="$PR_NUMBER" \
-              || echo "::warning::Could not start AI Review"
-          fi
 
       - name: Fail if the scan or record failed
         if: always() && steps.report.outputs.state != ''
