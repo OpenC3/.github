@@ -1,0 +1,187 @@
+# Adversarial AI review: once every CI run for the PR head has finished and the
+# Malicious Code Scan has passed (see malicious-code-scan-reusable.yml), Claude
+# and Codex take turns reviewing the PR, fixing CI failures and other issues,
+# and committing fixes until one of them approves without changes. This
+# workflow finds the PR and queues its reviews; ai-review-run.yml does the
+# review itself, split across runners so the agents never share one with a
+# token that can write (see that file).
+#
+# Called from workflow-templates/ai-review.yml, which a repository copies in and
+# triggers on workflow_run (once per completed CI workflow) and on
+# workflow_dispatch (which the scan uses when it passes). The gate lets only the
+# run that sees everything finished go ahead. workflow_run only uses the
+# caller's copy on its default branch, and the scripts and prompt come from this
+# repository, so a PR cannot change how it is reviewed.
+#
+# Secrets:
+#   ANTHROPIC_API_KEY     - Claude API key (required)
+#   OPENAI_API_KEY        - Codex / OpenAI API key (required)
+#   AI_REVIEW_PUSH_TOKEN  - Token that pushes fixes: a GitHub App token (or fine-grained PAT) with
+#                           contents:write on this repository and no workflows permission, so
+#                           GitHub itself refuses a push that changes a workflow. Without it the
+#                           review still runs and comments, but fixes are not pushed: a
+#                           GITHUB_TOKEN push triggers neither CI nor the Malicious Code Scan, so
+#                           the required scan status would never report on the new head and the
+#                           PR could not merge until someone pushed again.
+#
+# The caller must grant the job actions: read, contents: read, pull-requests: write and
+# statuses: read. Add the `skip-ai-review` label to a PR to opt out.
+#
+# Third party actions are pinned to a full commit SHA, because a tag can be moved
+# to point at different code. The comment after each pin records the tag it was.
+
+name: AI Review (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: PR to review (from the caller's workflow_dispatch); empty for workflow_run
+        required: false
+        type: string
+        default: ""
+      force:
+        description: Review even if this commit was already reviewed
+        required: false
+        type: boolean
+        default: false
+      review_instructions:
+        description: Repository-specific guidance appended to the reviewers' prompt
+        required: false
+        type: string
+        default: ""
+      max_turns:
+        description: Reviewer turns before giving up without converging (default 6)
+        required: false
+        type: string
+        default: ""
+      max_ci_rounds:
+        description: Consecutive AI fix rounds allowed while CI keeps failing (default 3)
+        required: false
+        type: string
+        default: ""
+      claude_model:
+        description: Claude model (default claude-opus-5-5)
+        required: false
+        type: string
+        default: ""
+      codex_model:
+        description: Codex model (default is Codex's own)
+        required: false
+        type: string
+        default: ""
+      claude_max_budget_usd:
+        description: Spend cap per Claude turn in USD (default 5)
+        required: false
+        type: string
+        default: ""
+      codex_sandbox:
+        description: Codex sandbox mode inside the agent container (default danger-full-access; the container is the sandbox)
+        required: false
+        type: string
+        default: ""
+      scan_workflow_name:
+        description: Name of the caller's Malicious Code Scan workflow, which the gate does not wait on
+        required: false
+        type: string
+        default: Malicious Code Scan
+      scan_status_context:
+        description: Commit status the Malicious Code Scan reports, which must be success
+        required: false
+        type: string
+        default: security/malicious-code-scan
+      shared_ref:
+        description: Ref of OpenC3/.github to take the scripts and prompt from; match the ref in `uses:` (ai-review-run.yml is always taken from main)
+        required: false
+        type: string
+        default: main
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      OPENAI_API_KEY:
+        required: true
+      AI_REVIEW_PUSH_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # workflow_run.pull_requests can be empty, and a group keyed on anything else would let a CI
+  # trigger and a dispatch for the same PR review it at once; look the number up first
+  pr:
+    name: Find the PR
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.event == 'pull_request' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      number: ${{ steps.find.outputs.number }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Find the PR
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [[ -z "$PR_NUMBER" ]]; then
+            PR_NUMBER="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls" \
+              --jq '[.[] | select(.state == "open")][0].number // empty')"
+          fi
+          if [[ -n "$PR_NUMBER" && ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::pr_number must be a number, not '$PR_NUMBER'"
+            exit 1
+          fi
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+  # The review runs in its own reusable workflow (ai-review-run.yml) so this queue covers all of its
+  # jobs: a queued trigger cannot pass the gate while an earlier review of the PR is still
+  # publishing. One review per PR at a time; extra triggers queue and then exit in the gate. Keep
+  # every pending run (default is one) so a manual `force` dispatch is not replaced by a CI trigger.
+  # Without a PR the gate skips; key on the commit so those runs do not queue behind each other.
+  review:
+    needs: pr
+    concurrency:
+      group: ${{ github.workflow }}-${{ needs.pr.outputs.number || github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+      queue: max
+    # The most any job of the review gets; each job takes only what it needs
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+      statuses: read
+    # A uses: ref cannot be an expression; keep this on the ref callers use, as with shared_ref
+    uses: OpenC3/.github/.github/workflows/ai-review-run.yml@main
+    with:
+      pr_number: ${{ needs.pr.outputs.number }}
+      force: ${{ inputs.force }}
+      review_instructions: ${{ inputs.review_instructions }}
+      max_turns: ${{ inputs.max_turns }}
+      max_ci_rounds: ${{ inputs.max_ci_rounds }}
+      claude_model: ${{ inputs.claude_model }}
+      codex_model: ${{ inputs.codex_model }}
+      claude_max_budget_usd: ${{ inputs.claude_max_budget_usd }}
+      codex_sandbox: ${{ inputs.codex_sandbox }}
+      scan_workflow_name: ${{ inputs.scan_workflow_name }}
+      scan_status_context: ${{ inputs.scan_status_context }}
+      shared_ref: ${{ inputs.shared_ref }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      AI_REVIEW_PUSH_TOKEN: ${{ secrets.AI_REVIEW_PUSH_TOKEN }}

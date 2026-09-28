@@ -1,0 +1,62 @@
+# Adversarial AI review: once CI has finished and the Malicious Code Scan has
+# passed, Claude and Codex take turns reviewing each pull request, fixing CI
+# failures and other issues, until one approves without changes.
+# Copy this file to .github/workflows/ in the repo, alongside malicious-code-scan.yml
+# (the review never starts without a passing scan), and:
+# 1. List every workflow that runs on pull_request under `workflows:` below. The review
+#    starts when one of them completes and all CI is done, so a missing one that finishes
+#    last means no review. Each run warns about any that are missing.
+# 2. Replace $default-branch under `branches-ignore:` with your default branch name.
+#    GitHub substitutes it only when you start the workflow from the Actions tab; the
+#    literal matches no branch, which only adds skipped runs for pushes.
+# 3. Add ANTHROPIC_API_KEY and OPENAI_API_KEY to the repo (or org) secrets, and
+#    AI_REVIEW_PUSH_TOKEN so the reviewers' fixes are pushed: a GitHub App token (or
+#    fine-grained PAT) with contents:write and no workflows permission, so GitHub refuses
+#    a push that changes a workflow.
+# 4. Optionally describe what to look for in review_instructions.
+#
+# Add the `skip-ai-review` label to a PR to opt out. Changes to this file take effect once
+# they are on the default branch.
+
+name: AI Review
+
+on:
+  workflow_run:
+    workflows:
+      - CI  # Update this
+    types:
+      - completed
+    branches-ignore:
+      - $default-branch
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to review
+        required: true
+      force:
+        description: Review even if this commit was already reviewed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    uses: OpenC3/.github/.github/workflows/ai-review-reusable.yml@main
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+      statuses: read
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      force: ${{ inputs.force || false }}
+      # review_instructions: |  # Uncomment to add repository-specific guidance for the reviewers
+      #   - Check that ...
+      # max_turns: "6"  # Uncomment and update if needed
+      # claude_model: claude-opus-5-5  # Uncomment and update if needed
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      AI_REVIEW_PUSH_TOKEN: ${{ secrets.AI_REVIEW_PUSH_TOKEN }}

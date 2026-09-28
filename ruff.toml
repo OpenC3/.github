@@ -1,0 +1,19 @@
+# Lint and format settings for the Python in ai-review/, malicious-code-scan/ and tests/,
+# matching the OpenC3 COSMOS python package they came from
+line-length = 120
+target-version = "py310"
+extend-exclude = ["playwright-plugin"]
+
+[lint]
+select = ["E", "F", "I", "N", "UP", "B", "W", "C4", "SIM"]
+ignore = [
+    "E501",   # Line too long (handled by the formatter)
+    "SIM108", # Use ternary operator (not always more readable)
+]
+
+[lint.isort]
+lines-after-imports = 2
+
+[format]
+quote-style = "double"
+indent-style = "space"

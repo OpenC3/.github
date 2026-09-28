@@ -1,0 +1,369 @@
+# Scans a PR for obfuscated code, prompt injection, and other malicious changes
+# (see malicious-code-scan/malicious_code_scan.py), and gates the AI Review
+# workflow on the result.
+#
+# Called from workflow-templates/malicious-code-scan.yml on pull_request_target,
+# so the caller comes from the default branch and the scanner from this
+# repository: a PR cannot edit its way past the scan, and fork PRs get the
+# Claude review too. That is only safe because the PR is never checked out or
+# executed here -- its commits are fetched and read with git diff as data. Do
+# not add steps that run code from the PR.
+#
+# The result is posted as the commit status `security/malicious-code-scan` on
+# the PR head; make that a required check in branch protection.
+#
+# Blocking findings can be accepted by a maintainer (write access or above)
+# adding the `malicious-scan-override` label. The override applies only to a
+# commit whose scan already failed, so a push that lands just before the label
+# is not accepted unseen; a new push is rescanned and the label is removed if it
+# blocks again.
+#
+# Editing only the PR title or description rechecks just that text with the
+# deterministic rules (the code and its Claude review are unchanged), which keeps
+# repeated edits from re-billing a full Claude review of the diff.
+#
+# Secrets: ANTHROPIC_API_KEY (the Claude review is skipped with a warning without it)
+#
+# The caller must grant the job contents: read, statuses: write, pull-requests: write and
+# actions: write.
+#
+# Third party actions are pinned to a full commit SHA, because a tag can be moved
+# to point at different code. The comment after each pin records the tag it was.
+
+name: Malicious Code Scan (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      review_workflow:
+        description: File name of the caller's AI Review workflow to start when the scan passes; empty for none
+        required: false
+        type: string
+        default: ai-review.yml
+      project_description:
+        description: What the repository is, for the Claude review (default names the repository)
+        required: false
+        type: string
+        default: ""
+      generated_paths:
+        description: >-
+          Committed build output, as git :(glob) patterns one per line (e.g. docs/assets/**), to check
+          only with high-signal rules and leave out of the Claude review; minified files always are.
+          Keep it narrow: a PR chooses its file paths, and nothing listed here should run in CI.
+        required: false
+        type: string
+        default: ""
+      claude_model:
+        description: Claude model for the semantic review (default claude-opus-5-5)
+        required: false
+        type: string
+        default: ""
+      shared_ref:
+        description: Ref of OpenC3/.github to take the scanner from; match the ref in `uses:`
+        required: false
+        type: string
+        default: main
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  STATUS_CONTEXT: security/malicious-code-scan
+  OVERRIDE_LABEL: malicious-scan-override
+
+jobs:
+  scan:
+    # Other labels do not change the result; rescanning on them would only cost money
+    if: github.event.action != 'labeled' || github.event.label.name == 'malicious-scan-override'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Full scans and metadata rechecks publish the same status, so serialize them.
+    # Queue pending runs too: a description edit must not replace a queued full scan.
+    # Keep this on the job so unrelated labels do not enter the queue.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      statuses: write # report the result on the PR head commit
+      pull-requests: write # remove a stale override label
+      actions: write # start AI Review once the scan passes
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      METADATA_ONLY: ${{ github.event.action == 'edited' && !github.event.changes.base }}
+      SCANNER: ${{ github.workspace }}/shared/malicious-code-scan/malicious_code_scan.py
+      SCAN_RECORD: ${{ github.workspace }}/shared/malicious-code-scan/scan_record.py
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Check the trigger
+        # Under pull_request the caller would come from the PR, which could skip the scan
+        if: github.event_name != 'pull_request_target'
+        run: |
+          echo "::error::Call this workflow on pull_request_target"
+          exit 1
+
+      - name: Mark scan pending
+        # A metadata-only recheck leaves the full scan's result in place unless it finds something
+        if: env.METADATA_ONLY != 'true'
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" -f state=pending -f context="$STATUS_CONTEXT" \
+            -f description="Scanning for malicious changes" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > /dev/null
+
+      # The trusted scanner
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OpenC3/.github
+          ref: ${{ inputs.shared_ref }}
+          sparse-checkout: malicious-code-scan
+          path: shared
+          persist-credentials: false
+
+      # Base branch only, for its history; the PR is fetched into it as data
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Fetched as data for git diff; never checked out or run
+      - name: Fetch PR commits
+        working-directory: repo
+        run: |
+          # The checkout kept no credentials, and a private repository needs them; pass the token to
+          # this fetch only
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" \
+            fetch --no-tags --no-recurse-submodules origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
+          if [[ "$(git rev-parse refs/remotes/pr/head)" != "$HEAD_SHA" ]]; then
+            echo "::error::PR head moved during the scan; the new push will be scanned by its own run"
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.5"
+          python-version: "3.12"
+
+      - name: Scan
+        id: scan
+        working-directory: repo
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SCAN_CLAUDE_MODEL: ${{ inputs.claude_model }}
+          SCAN_PROJECT_DESCRIPTION: ${{ inputs.project_description }}
+          SCAN_GENERATED_PATHS: ${{ inputs.generated_paths }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # Passed through env, never interpolated into the script: both are attacker-controlled
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          mode=()
+          [[ "$METADATA_ONLY" == "true" ]] && mode=(--metadata-only)
+          uv run --script --locked --no-build "$SCANNER" \
+            --base "$BASE_SHA" --head "$HEAD_SHA" ${mode[@]+"${mode[@]}"} \
+            --summary "$GITHUB_STEP_SUMMARY" --json "${RUNNER_TEMP}/malicious_scan.json"
+
+      - name: Recheck current PR metadata
+        id: metadata
+        if: steps.scan.outcome == 'success'
+        working-directory: repo
+        env:
+          EVENT_PR_TITLE: ${{ github.event.pull_request.title }}
+          EVENT_PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Events can queue out of order, and the text can change during a full scan.
+          # Check the current text before publishing, and do not reuse an override for new text.
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          if [[ "$(jq -r '.head.sha' <<< "$pr")" != "$HEAD_SHA" ]]; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # jq -j and the x sentinel keep trailing newlines, which the event text also keeps
+          PR_TITLE="$(jq -j '.title' <<< "$pr"; printf x)"
+          PR_TITLE="${PR_TITLE%x}"
+          PR_BODY="$(jq -j '.body // ""' <<< "$pr"; printf x)"
+          PR_BODY="${PR_BODY%x}"
+          export PR_TITLE PR_BODY
+          if [[ "$PR_TITLE" != "$EVENT_PR_TITLE" || "$PR_BODY" != "$EVENT_PR_BODY" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "has_override=$(jq '[.labels[].name] | index("malicious-scan-override") != null' <<< "$pr")" >> "$GITHUB_OUTPUT"
+          uv run --script --locked --no-build "$SCANNER" \
+            --base "$HEAD_SHA" --head "$HEAD_SHA" --metadata-only \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Report result
+        id: report
+        if: always()
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+          METADATA_OUTCOME: ${{ steps.metadata.outcome }}
+          METADATA_BLOCKING: ${{ steps.metadata.outputs.blocking }}
+          METADATA_CHANGED: ${{ steps.metadata.outputs.changed }}
+          STALE: ${{ steps.metadata.outputs.stale }}
+          CODE_BLOCKING: ${{ steps.scan.outputs.code_blocking }}
+          WARNINGS: ${{ steps.scan.outputs.warnings }}
+          ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          SENDER: ${{ github.event.sender.login }}
+          HAS_OVERRIDE: ${{ steps.metadata.outputs.has_override }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [[ "$STALE" == "true" ]]; then
+            echo "PR head moved; leaving the new commit to its own scan"
+            exit 0
+          fi
+          # Judge the PR text as it is now, not as this (possibly queued) event saw it, so a stale
+          # event cannot fail text the author already fixed
+          BLOCKING=$(( ${CODE_BLOCKING:-0} + ${METADATA_BLOCKING:-0} ))
+          if [[ "$METADATA_ONLY" == "true" && "$SCAN_OUTCOME" == "success" && "$METADATA_OUTCOME" == "success" &&
+                "$BLOCKING" == "0" ]]; then
+            echo "PR title/description are clean; keeping the existing scan result for ${HEAD_SHA}"
+            exit 0
+          fi
+          remove_override_label() {
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/${OVERRIDE_LABEL}" > /dev/null || true
+          }
+          # Status IDs must be recorded in artifacts from the trusted scan run. A URL pointing at
+          # that run, or an "Override" description, is not evidence that it issued the status.
+          # An optional second argument keeps only statuses posted before the label event.
+          own_statuses() {
+            local want_state="$1" before="${2:-}" status
+            local time_filter=""
+            if [[ -n "$before" ]]; then
+              [[ "$before" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 0
+              time_filter=" and .created_at != null and .created_at < \"$before\""
+            fi
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" --paginate \
+              --jq ".[] | select(.context == \"$STATUS_CONTEXT\" and .state == \"$want_state\"${time_filter})
+                | tojson" |
+              while IFS= read -r status; do
+                python3 "$SCAN_RECORD" --workflow "$GITHUB_WORKFLOW" --pr "$PR_NUMBER" \
+                  --head "$HEAD_SHA" --context "$STATUS_CONTEXT" --state "$want_state" <<< "$status" || true
+              done
+          }
+          # An earlier override of this exact commit survives rescans (e.g. a PR description edit)
+          prior_override="$(own_statuses success | grep '^Override' | head -n 1 || true)"
+
+          if [[ "$SCAN_OUTCOME" != "success" || "$METADATA_OUTCOME" != "success" ]]; then
+            # Fail closed: a scanner error is not a pass
+            state=error
+            description="Scanner failed; re-run the job"
+          elif [[ "$METADATA_CHANGED" == "true" && "${METADATA_BLOCKING:-0}" != "0" ]]; then
+            state=failure
+            description="PR title/description: ${METADATA_BLOCKING} blocking finding(s); a maintainer must review"
+            if [[ "$HAS_OVERRIDE" == "true" ]]; then
+              remove_override_label
+            fi
+          elif [[ "${BLOCKING:-0}" == "0" ]]; then
+            state=success
+            description="No blocking findings (${WARNINGS:-0} warning(s))"
+          elif [[ "$ACTION" == "labeled" && "$LABEL_NAME" == "$OVERRIDE_LABEL" ]]; then
+            # Labels only need triage access; accepting a security finding needs write.
+            # Fails closed if the permission cannot be read.
+            permission="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${SENDER}/permission" --jq .permission 2> /dev/null || true)"
+            # The label event carries whatever the head is now. Only accept it for a commit whose
+            # blocking result the maintainer could have seen, not one pushed just before the label.
+            # This run may have queued behind that commit's scan, so the failure must also predate
+            # the label: a run's created_at is when its event fired, even for a queued run or a re-run.
+            label_time="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at || true)"
+            prior_failure=""
+            if [[ -n "$label_time" ]]; then
+              prior_failure="$(own_statuses failure "$label_time" | head -n 1 || true)"
+            fi
+            state=failure
+            if [[ "$permission" != "admin" && "$permission" != "write" ]]; then
+              description="Rejected override by @${SENDER} (needs write access); ${BLOCKING} blocking finding(s)"
+              remove_override_label
+            elif [[ -z "$prior_failure" ]]; then
+              description="Rejected override: ${HEAD_SHA:0:7} was not reported as blocked before the label; review it and relabel"
+              remove_override_label
+            else
+              state=success
+              description="Override by @${SENDER}: ${BLOCKING} finding(s) accepted"
+            fi
+          elif [[ "$HAS_OVERRIDE" == "true" && -n "$prior_override" && "$METADATA_ONLY" != "true" ]]; then
+            # (A description edit that blocks is new text the override never covered)
+            state=success
+            description="$prior_override"
+          else
+            state=failure
+            description="${BLOCKING} blocking finding(s); a maintainer must review"
+            if [[ "$METADATA_ONLY" == "true" ]]; then
+              # A later clean edit does not clear this; fix the text, then push or have a maintainer override
+              description="PR title/description: ${BLOCKING} blocking finding(s); a maintainer must review"
+            fi
+            if [[ "$HAS_OVERRIDE" == "true" ]]; then
+              # The label was for an earlier commit
+              remove_override_label
+            fi
+          fi
+
+          echo "Result: $state - $description"
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f description="${description:0:140}" -f target_url="$run_url" > "${RUNNER_TEMP}/malicious-scan-status.json"
+          # Record the ID returned by GitHub, never an ID supplied by a PR or a status lookup.
+          jq --arg repository "$GITHUB_REPOSITORY" --argjson pr "$PR_NUMBER" --arg head "$HEAD_SHA" \
+            --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            '{version: 1, repository: $repository, pr: $pr, head_sha: $head, run_id: $run,
+              run_attempt: $attempt, status_id: .id, state: .state, context: .context,
+              description: .description, created_at: .created_at}' \
+            "${RUNNER_TEMP}/malicious-scan-status.json" > "${RUNNER_TEMP}/malicious-scan-record.json"
+          echo "status_id=$(jq -er '.status_id' "${RUNNER_TEMP}/malicious-scan-record.json")" >> "$GITHUB_OUTPUT"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      # Upload even a blocking result, so a later maintainer override can verify it. Artifacts are
+      # scoped to this trusted run and immutable. Each new status (including reruns) gets its own.
+      - name: Upload scan record
+        id: record
+        if: always() && steps.report.outputs.status_id != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: malicious-scan-status-${{ steps.report.outputs.status_id }}
+          path: ${{ runner.temp }}/malicious-scan-record.json
+          if-no-files-found: error
+
+      - name: Start AI Review
+        if: steps.record.outcome == 'success' && steps.report.outputs.state == 'success' && env.METADATA_ONLY != 'true'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
+        run: |
+          # The gate can now authenticate the status even before this run concludes.
+          if [[ -n "$REVIEW_WORKFLOW" ]]; then
+            gh workflow run "$REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f pr_number="$PR_NUMBER" \
+              || echo "::warning::Could not start AI Review"
+          fi
+
+      - name: Fail if the scan or record failed
+        if: always() && steps.report.outputs.state != ''
+        env:
+          STATE: ${{ steps.report.outputs.state }}
+          RECORD_OUTCOME: ${{ steps.record.outcome }}
+        run: |
+          if [[ "$RECORD_OUTCOME" != "success" ]]; then
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" -f state=error -f context="$STATUS_CONTEXT" \
+              -f description="Scan record upload failed; re-run the job" \
+              -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > /dev/null
+            exit 1
+          fi
+          if [[ "$STATE" != "success" ]]; then
+            exit 1
+          fi
