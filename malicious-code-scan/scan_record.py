@@ -16,6 +16,9 @@ The scan therefore uploads an immutable artifact containing the ID GitHub assign
 along with the repository, PR, head, and result. An unrelated workflow cannot upload artifacts into
 that run. Missing/expired records fail closed; rerun the scan to produce a new one.
 
+A trusted run is one of the scan workflow on pull_request_target, or on workflow_dispatch from a
+commit of the default branch (dispatched from any other ref, the caller workflow could be the PR's).
+
 Reads one status JSON object from stdin and prints its description only after verification.
 Uses gh for authentication and downloads; archive contents are read in memory, never extracted.
 """
@@ -36,6 +39,22 @@ def api(path: str, *options: str) -> bytes:
     return subprocess.run(["gh", "api", path, *options], capture_output=True, check=True).stdout
 
 
+def trusted_run(run: dict, args: argparse.Namespace) -> bool:
+    if run.get("name") != args.workflow:
+        return False
+    if run.get("event") == "pull_request_target":
+        return True
+    if run.get("event") != "workflow_dispatch":
+        return False
+    default_branch = json.loads(api(f"repos/{args.repository}"))["default_branch"]
+    head = run.get("head_sha") or ""
+    if run.get("head_branch") != default_branch or not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        return False
+    # head_branch alone could be a tag of the same name; the commit itself must be on the branch
+    status = api(f"repos/{args.repository}/compare/{head}...{default_branch}", "--jq", ".status")
+    return status.decode().strip() in ("ahead", "identical")
+
+
 def verified_description(status: dict, args: argparse.Namespace) -> str:
     if status.get("state") != args.state or status.get("context") != args.context:
         raise ValueError("unexpected status state or context")
@@ -49,7 +68,7 @@ def verified_description(status: dict, args: argparse.Namespace) -> str:
     run_id = int(url[len(prefix) :])
     run_path = f"repos/{args.repository}/actions/runs/{run_id}"
     run = json.loads(api(run_path))
-    if run.get("event") != "pull_request_target" or run.get("name") != args.workflow:
+    if not trusted_run(run, args):
         raise ValueError("status does not link to the trusted scan workflow")
 
     name = f"malicious-scan-status-{status_id}"
@@ -87,12 +106,9 @@ def verified_description(status: dict, args: argparse.Namespace) -> str:
     # A later rerun must not change the provenance or conclusion of an earlier status.
     if attempt != run["run_attempt"]:
         run = json.loads(api(f"{run_path}/attempts/{attempt}"))
-    if run.get("event") != "pull_request_target" or run.get("name") != args.workflow:
-        raise ValueError("untrusted scan attempt")
-    conclusions = {args.state}
-    if args.allow_running:
-        conclusions.add(None)
-    if run.get("conclusion") not in conclusions:
+        if not trusted_run(run, args):
+            raise ValueError("untrusted scan attempt")
+    if run.get("conclusion") != args.state:
         raise ValueError("scan attempt has not concluded with the reported result")
     return record["description"]
 
@@ -105,7 +121,6 @@ def main() -> int:
     parser.add_argument("--head", required=True)
     parser.add_argument("--context", required=True)
     parser.add_argument("--state", required=True, choices=("success", "failure"))
-    parser.add_argument("--allow-running", action="store_true")
     args = parser.parse_args()
     try:
         description = verified_description(json.load(sys.stdin), args)
