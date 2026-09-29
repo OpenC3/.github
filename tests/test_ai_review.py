@@ -104,6 +104,22 @@ if '--jq' in args:
 print(value if isinstance(value, str) else json.dumps([value] if '--slurp' in args else value))
 """
 
+# Stands in for curl, which only the gate's SonarQube calls use: answers from the fixture
+# "sonar:<path after /api/>", fails like `curl -f` for a missing one, and records the arguments and
+# the config it read from stdin (where the token goes).
+FAKE_CURL = """
+import json, os, pathlib, sys
+args = sys.argv[1:]
+config = sys.stdin.read() if '-K' in args else ''
+with open(os.environ['REVIEW_TEST_CALLS'], 'a') as output:
+    output.write(json.dumps({'curl': args, 'config': config}) + '\\n')
+fixtures = json.loads(pathlib.Path(os.environ['REVIEW_TEST_FIXTURES']).read_text())
+value = fixtures.get('sonar:' + args[-1].split('/api/', 1)[1])
+if value is None:
+    sys.exit(22)
+print(value if isinstance(value, str) else json.dumps(value))
+"""
+
 # Stands in for docker: records its arguments, and for `docker run` without -d (an agent turn) runs
 # the command on the host with only the container's environment, in its working directory. The
 # proxy (`docker run -d`) and the network commands do nothing.
@@ -237,6 +253,7 @@ class ReviewTests(unittest.TestCase):
             "repos/owner/repo/commits/test-head": {"commit": {"message": BOT_MESSAGE}},
             "repos/owner/repo/pulls/1/commits": [{"commit": {"message": BOT_MESSAGE}}],
             "repos/owner/repo/collaborators/author/permission": {"permission": "write"},
+            "repos/owner/repo/commits/test-head/check-runs?per_page=100": {"check_runs": []},
         }
         self.env = dict(
             os.environ,
@@ -268,6 +285,7 @@ class ReviewTests(unittest.TestCase):
         self.add_scan_record(self.fixtures["repos/owner/repo/commits/test-head/status"]["statuses"][0])
         for name, code in {
             "gh": FAKE_GH,
+            "curl": FAKE_CURL,
             "claude": FAKE_AGENT,
             "codex": FAKE_AGENT,
             "docker": FAKE_DOCKER,
@@ -932,6 +950,196 @@ class ReviewTests(unittest.TestCase):
         result = self.run_shell(f'bash "{GATE}"')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs()["skip"], "false")
+
+    SONAR_QUERY = "projectKey=Org%3Arepo&pullRequest=1"
+
+    def sonar_check(self, status="completed"):
+        return {
+            "name": "SonarCloud Code Analysis",
+            "app": {"slug": "sonarqubecloud"},
+            "status": status,
+            "conclusion": "failure" if status == "completed" else None,
+            # The project key arrives URL-encoded
+            "details_url": "https://sonarcloud.io/dashboard?id=Org%3Arepo&pullRequest=1",
+        }
+
+    def add_sonar(self):
+        self.fixtures["repos/owner/repo/commits/test-head/check-runs?per_page=100"] = {
+            "check_runs": [
+                {"name": "build", "app": {"slug": "github-actions"}, "status": "completed"},
+                self.sonar_check(),
+            ]
+        }
+        self.fixtures[f"sonar:qualitygates/project_status?{self.SONAR_QUERY}"] = {
+            "projectStatus": {
+                "status": "ERROR",
+                "conditions": [
+                    {
+                        "status": "ERROR",
+                        "metricKey": "new_code_smells",
+                        "comparator": "GT",
+                        "errorThreshold": "0",
+                        "actualValue": "2",
+                    },
+                    {
+                        "status": "OK",
+                        "metricKey": "new_coverage",
+                        "comparator": "LT",
+                        "errorThreshold": "80",
+                        "actualValue": "90",
+                    },
+                ],
+            }
+        }
+        issues = "issues/search?componentKeys=Org%3Arepo&pullRequest=1&issueStatuses=OPEN,CONFIRMED&ps=500"
+        self.fixtures[f"sonar:{issues}"] = {
+            "paging": {"total": 2},
+            "issues": [
+                {
+                    "severity": "MAJOR",
+                    "component": "Org:repo:app/a.rb",
+                    "line": 495,
+                    "rule": "ruby:S1066",
+                    "message": "Merge this if",
+                },
+                {"severity": "MINOR", "component": "Org:repo:lib/b.py", "rule": "python:S1", "message": "Two\nlines"},
+            ],
+        }
+        self.fixtures[f"sonar:hotspots/search?{self.SONAR_QUERY}&status=TO_REVIEW&ps=500"] = {
+            "hotspots": [
+                {
+                    "vulnerabilityProbability": "LOW",
+                    "component": "Org:repo:app/c.rb",
+                    "line": 7,
+                    "ruleKey": "ruby:S5",
+                    "message": "Check this",
+                }
+            ]
+        }
+
+    def sonar_report(self):
+        return (self.directory / "out/sonar_findings.md").read_text()
+
+    def test_sonarqube_findings_reach_review(self):
+        self.add_sonar()
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "false")
+        # The failed gate condition and both issues; the hotspot is listed but not counted
+        self.assertEqual(self.outputs()["sonar_findings"], "3")
+        self.assertEqual(self.outputs()["ci_failures"], "1")
+        report = self.sonar_report()
+        self.assertIn("- new_code_smells is 2 (fails when GT 0)", report)
+        self.assertNotIn("new_coverage", report)
+        self.assertIn("### Open issues (2)", report)
+        self.assertIn("- **MAJOR** app/a.rb:495: Merge this if (rule ruby:S1066)", report)
+        self.assertIn("- **MINOR** lib/b.py: Two lines (rule python:S1)", report)
+        self.assertIn("### Security hotspots to review", report)
+        self.assertIn("- **LOW** app/c.rb:7: Check this (rule ruby:S5)", report)
+        # SonarQube findings are not CI failures
+        self.assertNotIn("Sonar", (self.directory / "out/ci_failures.md").read_text())
+
+    def test_sonarqube_project_key_can_be_set(self):
+        self.add_sonar()
+        check = self.fixtures["repos/owner/repo/commits/test-head/check-runs?per_page=100"]["check_runs"][1]
+        check["details_url"] = "https://example.invalid/elsewhere"
+        result = self.run_shell(f'bash "{GATE}"', {"SONAR_PROJECT_KEY": "Org:repo"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["sonar_findings"], "3")
+        # Without the setting there is no key, so nothing is fetched
+        self.outputs_path.unlink()
+        self.calls_path.unlink()
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["sonar_findings"], "0")
+        self.assertIn("No usable SonarQube project key", result.stdout)
+        self.assertNotIn('"curl"', self.calls_path.read_text())
+
+    def test_sonarqube_token_is_sent_only_through_stdin(self):
+        self.add_sonar()
+        result = self.run_shell(f'bash "{GATE}"', {"SONAR_TOKEN": "sonar-secret"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        curls = [call for call in map(json.loads, self.calls_path.read_text().splitlines()) if "curl" in call]
+        self.assertEqual(len(curls), 3)
+        for call in curls:
+            self.assertNotIn("sonar-secret", json.dumps(call["curl"]))
+            self.assertEqual(call["config"], 'header = "Authorization: Bearer sonar-secret"\n')
+            self.assertTrue(call["curl"][-1].startswith("https://sonarcloud.io/api/"))
+
+    def test_gate_waits_for_a_running_sonarqube_analysis(self):
+        self.add_sonar()
+        path = "repos/owner/repo/commits/test-head/check-runs?per_page=100"
+        self.fixtures[path] = {
+            "test_sequence": [
+                {"check_runs": [self.sonar_check("queued")]},
+                {"check_runs": [self.sonar_check("in_progress")]},
+                {"check_runs": [self.sonar_check()]},
+            ]
+        }
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("Waiting for the SonarQube analysis"), 2)
+        self.assertEqual(self.outputs()["sonar_findings"], "3")
+
+    def test_gate_gives_up_waiting_for_sonarqube_without_its_findings(self):
+        self.add_sonar()
+        self.fixtures["repos/owner/repo/commits/test-head/check-runs?per_page=100"] = {
+            "check_runs": [self.sonar_check("in_progress")]
+        }
+        result = self.run_shell(f'bash "{GATE}"', {"SONAR_WAIT_MINUTES": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "false")
+        self.assertEqual(self.outputs()["sonar_findings"], "0")
+        self.assertIn("still in_progress", result.stdout)
+        self.assertEqual(self.sonar_report(), "")
+
+    def test_sonarqube_trouble_does_not_stop_the_review(self):
+        self.add_sonar()
+        for key in [key for key in self.fixtures if key.startswith("sonar:")]:
+            self.fixtures[key] = "<html>Service unavailable</html>"
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "false")
+        self.assertEqual(self.outputs()["sonar_findings"], "0")
+        self.assertEqual(result.stdout.count("::warning::Could not read the SonarQube"), 3)
+        # Nor does a token without checks: read
+        self.fixtures["repos/owner/repo/commits/test-head/check-runs?per_page=100"] = {"test_api_error": True}
+        self.outputs_path.unlink()
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "false")
+        self.assertIn("checks: read", result.stdout)
+
+    def test_ai_fix_commit_goes_again_for_sonarqube_findings(self):
+        # The head is an AI review fix; with CI passing, only SonarQube findings send it round again
+        self.fixtures["repos/owner/repo/actions/runs?head_sha=test-head&per_page=100"]["workflow_runs"][0][
+            "conclusion"
+        ] = "success"
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(self.outputs()["skip"], "true")
+        self.assertIn("CI passed", self.outputs()["reason"])
+        self.add_sonar()
+        self.outputs_path.unlink()
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["skip"], "false")
+        self.assertEqual(self.outputs()["ci_failures"], "0")
+
+    def test_loop_hands_sonarqube_findings_to_the_reviewers(self):
+        findings = self.directory / "sonar_findings.md"
+        findings.write_text("### Open issues (1)\n\n- **MAJOR** app/a.rb:495: Merge this if (rule ruby:S1066)\n")
+        result, _, _, _ = self.run_loop(extra={"SONAR_FINDINGS_FILE": str(findings), "SONAR_FINDING_COUNT": "1"})
+        prompt = (self.directory / "out/prompt-1.md").read_text()
+        section = prompt.split("## SonarQube findings for the commit under review", 1)[1]
+        self.assertIn("app/a.rb:495: Merge this if", section.split("## Previous turns", 1)[0])
+        self.assertIn("If SonarQube reported findings", prompt)
+        self.assertIn("SonarQube had 1 finding(s)", result["body"])
+
+    def test_loop_tells_reviewers_when_sonarqube_found_nothing(self):
+        result, _, _, _ = self.run_loop()
+        prompt = (self.directory / "out/prompt-1.md").read_text()
+        self.assertIn("## SonarQube findings for the commit under review\n\nNone reported.", prompt)
+        self.assertNotIn("SonarQube had", result["body"])
 
     def check_triggers(self, workflows):
         directory = self.directory / "workflows"

@@ -11,7 +11,7 @@
 # if purchased from OpenC3, Inc.
 
 # Decides whether the AI review loop should run for a PR and collects failed
-# CI job logs for the reviewers. Every CI workflow completion triggers the AI
+# CI job logs and SonarQube findings for the reviewers. Every CI workflow completion triggers the AI
 # Review workflow, so this lets only the run that sees all CI finished proceed.
 # The Malicious Code Scan does not trigger the review, so that run waits for a
 # scan still running on the PR head. A manual (workflow_dispatch) run fails
@@ -21,9 +21,12 @@
 # One of: PR_NUMBER, HEAD_SHA
 # Optional env: FORCE (review even if this commit was already reviewed), REVIEW_WORKFLOW,
 #               SCAN_WORKFLOW, SCAN_CONTEXT, MAX_CI_ROUNDS, LOG_LINES,
-#               SCAN_WAIT_MINUTES (how long to wait for a running scan), SCAN_POLL_SECONDS
+#               SCAN_WAIT_MINUTES (how long to wait for a running scan), SCAN_POLL_SECONDS,
+#               SONAR_PROJECT_KEY (default: from the SonarQube check run), SONAR_TOKEN (for a private
+#               project), SONAR_HOST_URL, SONAR_APP (the check run's app slug),
+#               SONAR_WAIT_MINUTES (how long to wait for a running analysis)
 #
-# Step outputs: skip, reason, pr, head_sha, head_ref, base_ref, ci_failures
+# Step outputs: skip, reason, pr, head_sha, head_ref, base_ref, ci_failures, sonar_findings
 
 set -euo pipefail
 
@@ -39,6 +42,10 @@ MAX_CI_ROUNDS="${MAX_CI_ROUNDS:-3}"
 SCAN_WAIT_MINUTES="${SCAN_WAIT_MINUTES:-10}"
 SCAN_POLL_SECONDS="${SCAN_POLL_SECONDS:-30}"
 LOG_LINES="${LOG_LINES:-150}"
+SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-}"
+SONAR_HOST_URL="${SONAR_HOST_URL:-https://sonarcloud.io}"
+SONAR_APP="${SONAR_APP:-sonarqubecloud}"
+SONAR_WAIT_MINUTES="${SONAR_WAIT_MINUTES:-10}"
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 repo="$GITHUB_REPOSITORY"
 PR_NUMBER="${PR_NUMBER:-}"
@@ -46,7 +53,9 @@ HEAD_SHA="${HEAD_SHA:-}"
 
 mkdir -p "$OUT_DIR"
 CI_FILE="$OUT_DIR/ci_failures.md"
+SONAR_FILE="$OUT_DIR/sonar_findings.md"
 : > "$CI_FILE"
+: > "$SONAR_FILE"
 
 output() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
 skip() {
@@ -187,10 +196,95 @@ while IFS=$'\t' read -r run_id run_name run_conclusion run_url; do
 done < <(jq -r '.[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure")
   | [.id, .name, .conclusion, .html_url] | @tsv' <<< "$runs")
 
-# When the head commit is the loop's own fix, only go again to fix CI, and only a few times
+# SonarQube reports through its GitHub App as a check run, not an Actions run, so the runs above
+# never include it. Wait for its analysis of this commit, then collect what it found on the PR.
+# Sonar trouble (no check run, an outage, no checks: read) only leaves its findings out.
+sonar_findings=0
+sonar_check() {
+  gh api "repos/$repo/commits/$HEAD_SHA/check-runs?per_page=100" --paginate \
+    --jq ".check_runs[] | select(.app.slug == \"$SONAR_APP\")" | jq -s '.[0] // {}'
+}
+# The token goes through stdin rather than the command line. Anything but a JSON object fails, so
+# the callers' jq cannot stop the gate on an error page.
+sonar_api() {
+  if [[ -n "${SONAR_TOKEN:-}" ]]; then
+    printf 'header = "Authorization: Bearer %s"\n' "$SONAR_TOKEN"
+  fi | curl -fsS --max-time 30 -K - "$SONAR_HOST_URL/api/$1" | jq -ce 'objects'
+}
+if ! sonar="$(sonar_check)"; then
+  echo "::warning::Could not read the check runs on $HEAD_SHA (does the workflow have checks: read?); SonarQube findings are left out"
+  sonar='{}'
+fi
+deadline=$((SECONDS + SONAR_WAIT_MINUTES * 60))
+while [[ "$(jq -r '.status // "completed"' <<< "$sonar")" != "completed" ]] && (( SECONDS < deadline )); do
+  [[ "$(gh api "repos/$repo/pulls/$PR_NUMBER" --jq .head.sha)" == "$HEAD_SHA" ]] ||
+    skip "the PR head moved past $HEAD_SHA while waiting for the SonarQube analysis"
+  echo "Waiting for the SonarQube analysis on $HEAD_SHA ($(jq -r .status <<< "$sonar"))"
+  sleep "$SCAN_POLL_SECONDS"
+  sonar="$(sonar_check)" || sonar='{}'
+done
+sonar_status="$(jq -r '.status // ""' <<< "$sonar")"
+if [[ -n "$sonar_status" && "$sonar_status" != "completed" ]]; then
+  echo "::warning::The SonarQube analysis of $HEAD_SHA was still $sonar_status after ${SONAR_WAIT_MINUTES} minute(s); its findings are left out"
+elif [[ -n "$sonar_status" ]]; then
+  project="$SONAR_PROJECT_KEY"
+  if [[ -z "$project" ]]; then
+    project="$(python3 -c 'import sys, urllib.parse as u; print(u.parse_qs(u.urlsplit(sys.argv[1]).query).get("id", [""])[0])' \
+      "$(jq -r '.details_url // ""' <<< "$sonar")")"
+  fi
+  if [[ ! "$project" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+    echo "::warning::No usable SonarQube project key ('$project'); set sonar_project_key. SonarQube findings are left out"
+  else
+    query="$(jq -rn --arg k "$project" --arg pr "$PR_NUMBER" '"projectKey=\($k | @uri)&pullRequest=\($pr | @uri)"')"
+    # Paths come back as <project>:<path>; messages are kept to one line. $project is jq's.
+    # shellcheck disable=SC2016
+    defs='def loc: (.component | ltrimstr($project + ":")) + (if .line then ":\(.line)" else "" end);
+      def text: gsub("[\r\n]+"; " ");'
+    if gate="$(sonar_api "qualitygates/project_status?$query")"; then
+      failed="$(jq -r '.projectStatus.conditions // [] | .[] | select(.status == "ERROR")
+        | "- \(.metricKey) is \(.actualValue) (fails when \(.comparator) \(.errorThreshold))"' <<< "$gate")"
+      if [[ -n "$failed" ]]; then
+        sonar_findings=$((sonar_findings + $(wc -l <<< "$failed")))
+        printf '### Quality gate failed\n\n%s\n\n' "$failed" >> "$SONAR_FILE"
+      fi
+    else
+      echo "::warning::Could not read the SonarQube quality gate for $project PR #$PR_NUMBER"
+    fi
+    if issues="$(sonar_api "issues/search?${query/projectKey=/componentKeys=}&issueStatuses=OPEN,CONFIRMED&ps=500")"; then
+      count="$(jq '.issues | length' <<< "$issues")"
+      if (( count > 0 )); then
+        sonar_findings=$((sonar_findings + count))
+        {
+          echo "### Open issues ($(jq '.paging.total // .total // (.issues | length)' <<< "$issues"))"
+          echo
+          jq -r --arg project "$project" "$defs"' .issues[] | "- **\(.severity // "?")** \(loc): \(.message | text) (rule \(.rule))"' <<< "$issues"
+          echo
+        } >> "$SONAR_FILE"
+      fi
+    else
+      echo "::warning::Could not read the SonarQube issues for $project PR #$PR_NUMBER"
+    fi
+    # Listed but not counted: one that is safe needs a human to mark it in SonarQube, which no fix
+    # commit can do, so counting it would send every fix round back for another
+    if hotspots="$(sonar_api "hotspots/search?$query&status=TO_REVIEW&ps=500")"; then
+      if (( $(jq '.hotspots | length' <<< "$hotspots") > 0 )); then
+        {
+          echo "### Security hotspots to review"
+          echo
+          jq -r --arg project "$project" "$defs"' .hotspots[] | "- **\(.vulnerabilityProbability // "?")** \(loc): \(.message | text) (rule \(.ruleKey))"' <<< "$hotspots"
+          echo
+        } >> "$SONAR_FILE"
+      fi
+    else
+      echo "::warning::Could not read the SonarQube security hotspots for $project PR #$PR_NUMBER"
+    fi
+  fi
+fi
+
+# When the head commit is the loop's own fix, only go again to fix CI or SonarQube findings, and only a few times
 head_message="$(gh api "repos/$repo/commits/$HEAD_SHA" --jq .commit.message)"
 if grep -q '^AI-Review-Bot: true$' <<< "$head_message"; then
-  (( failures > 0 )) || skip "head commit is an AI review fix and CI passed"
+  (( failures + sonar_findings > 0 )) || skip "head commit is an AI review fix and CI passed"
   # Count distinct loop runs among the consecutive AI review commits at the tip of the PR
   rounds="$(gh api "repos/$repo/pulls/$PR_NUMBER/commits" --paginate --jq '[.[].commit.message]' | jq -s '
     add | reverse
@@ -198,14 +292,15 @@ if grep -q '^AI-Review-Bot: true$' <<< "$head_message"; then
     | (if $human == null then . else .[:$human] end)
     | map(capture("(?m)^AI-Review-Run: (?<id>\\S+)$").id) | unique | length')"
   if (( rounds >= MAX_CI_ROUNDS )); then
-    skip "CI still failing after $rounds AI fix round(s) (max $MAX_CI_ROUNDS)"
+    skip "CI or SonarQube still failing after $rounds AI fix round(s) (max $MAX_CI_ROUNDS)"
   fi
 fi
 
-echo "PR #$PR_NUMBER at $HEAD_SHA: $total CI run(s) complete, $failures CI failure(s)"
+echo "PR #$PR_NUMBER at $HEAD_SHA: $total CI run(s) complete, $failures CI failure(s), $sonar_findings SonarQube finding(s)"
 output skip false
 output pr "$PR_NUMBER"
 output head_sha "$HEAD_SHA"
 output head_ref "$(pr_field .head.ref)"
 output base_ref "$(pr_field .base.ref)"
 output ci_failures "$failures"
+output sonar_findings "$sonar_findings"

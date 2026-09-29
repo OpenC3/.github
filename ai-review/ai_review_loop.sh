@@ -30,6 +30,7 @@
 # Required env: BASE_REF, CLAUDE_API_KEY, CODEX_API_KEY, SANDBOX_IMAGE (built from sandbox/)
 # Optional env: MAX_TURNS, TIME_LIMIT_MINUTES, CLAUDE_MODEL, CODEX_MODEL, CLAUDE_MAX_BUDGET_USD, CODEX_SANDBOX,
 #               CI_FAILURES_FILE (failed CI job logs from ai_review_gate.sh), CI_FAILURE_COUNT,
+#               SONAR_FINDINGS_FILE (SonarQube findings from ai_review_gate.sh), SONAR_FINDING_COUNT,
 #               REVIEW_INSTRUCTIONS (repository-specific guidance for the prompt), GITHUB_RUN_ID,
 #               RESULT_DIR, ANTHROPIC_UPSTREAM and OPENAI_UPSTREAM (where the proxy sends each API's calls)
 #
@@ -63,6 +64,7 @@ SCHEMA="$SCRIPT_DIR/schema.json"
 POLICY="$SCRIPT_DIR/patch_policy.py"
 HISTORY="$OUT_DIR/history.md"
 CI_FAILURES_FILE="${CI_FAILURES_FILE:-}"
+SONAR_FINDINGS_FILE="${SONAR_FINDINGS_FILE:-}"
 RUN_ID="${GITHUB_RUN_ID:-local}"
 
 # Keep the runner's system and user git config (such as its LFS filter) out of the harness's git
@@ -233,6 +235,16 @@ build_prompt() {
       echo "All CI checks passed."
     fi
     echo
+    echo "## SonarQube findings for the commit under review"
+    echo
+    if [[ -n "$SONAR_FINDINGS_FILE" && -s "$SONAR_FINDINGS_FILE" ]]; then
+      echo "SonarQube reported these on the PR. Fix them as your job describes (unless a previous turn already did):"
+      echo
+      cat "$SONAR_FINDINGS_FILE"
+    else
+      echo "None reported."
+    fi
+    echo
     echo "## Previous turns"
     echo
     if [[ -s "$HISTORY" ]]; then
@@ -329,6 +341,10 @@ write_result() {
     echo
     if [[ -n "$CI_FAILURES_FILE" && -s "$CI_FAILURES_FILE" ]]; then
       echo "CI had ${CI_FAILURE_COUNT:-some} failure(s) on the reviewed commit; the reviewers were asked to fix them."
+      echo
+    fi
+    if [[ -n "$SONAR_FINDINGS_FILE" && -s "$SONAR_FINDINGS_FILE" ]]; then
+      echo "SonarQube had ${SONAR_FINDING_COUNT:-some} finding(s) on the reviewed commit; the reviewers were asked to fix them."
       echo
     fi
     case "$state" in
