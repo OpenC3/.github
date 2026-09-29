@@ -17,6 +17,9 @@
 # Secrets:
 #   ANTHROPIC_API_KEY     - Claude API key (required)
 #   OPENAI_API_KEY        - Codex / OpenAI API key (required)
+#   SONAR_TOKEN           - SonarQube token that can browse the project (optional; only a private
+#                           project needs it). The gate collects the PR's SonarQube findings from
+#                           the SonarQube Cloud check run on the PR head for the reviewers to fix.
 #   AI_REVIEW_PUSH_TOKEN  - Token that pushes fixes: a GitHub App token (or fine-grained PAT) with
 #                           contents:write on this repository and no workflows permission, so
 #                           GitHub itself refuses a push that changes a workflow. Without it the
@@ -25,8 +28,8 @@
 #                           the required scan status would never report on the new head and the
 #                           PR could not merge until someone pushed again.
 #
-# The caller must grant the job actions: read, contents: read, pull-requests: write and
-# statuses: read. Add the `skip-ai-review` label to a PR to opt out. A manual run
+# The caller must grant the job actions: read, checks: read, contents: read, pull-requests: write
+# and statuses: read (without checks: read, SonarQube findings are left out). Add the `skip-ai-review` label to a PR to opt out. A manual run
 # fails when it cannot review, so it is not mistaken for a review that passed.
 #
 # Third party actions are pinned to a full commit SHA, because a tag can be moved
@@ -97,6 +100,16 @@ on:
         required: false
         type: string
         default: security/malicious-code-scan
+      sonar_project_key:
+        description: SonarQube project key whose PR findings the reviewers fix (default is taken from the SonarQube Cloud check run)
+        required: false
+        type: string
+        default: ""
+      sonar_wait_minutes:
+        description: How long the gate waits for a SonarQube analysis still running on the PR head (default 10)
+        required: false
+        type: string
+        default: ""
       shared_ref:
         description: Ref of OpenC3/.github to take the scripts and prompt from; match the ref in `uses:` (ai-review-run.yml is always taken from main)
         required: false
@@ -108,6 +121,8 @@ on:
       OPENAI_API_KEY:
         required: true
       AI_REVIEW_PUSH_TOKEN:
+        required: false
+      SONAR_TOKEN:
         required: false
 
 permissions:
@@ -170,6 +185,7 @@ jobs:
     # The most any job of the review gets; each job takes only what it needs
     permissions:
       actions: read
+      checks: read
       contents: read
       pull-requests: write
       statuses: read
@@ -188,8 +204,11 @@ jobs:
       scan_workflow_name: ${{ inputs.scan_workflow_name }}
       scan_wait_minutes: ${{ inputs.scan_wait_minutes }}
       scan_status_context: ${{ inputs.scan_status_context }}
+      sonar_project_key: ${{ inputs.sonar_project_key }}
+      sonar_wait_minutes: ${{ inputs.sonar_wait_minutes }}
       shared_ref: ${{ inputs.shared_ref }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       AI_REVIEW_PUSH_TOKEN: ${{ secrets.AI_REVIEW_PUSH_TOKEN }}
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

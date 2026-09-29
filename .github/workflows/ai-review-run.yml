@@ -3,7 +3,8 @@
 # and only the permissions it needs, so what the agents can reach holds nothing
 # worth escaping their sandbox for:
 #
-#   gate    - decides whether to review and collects failed CI logs (read-only token)
+#   gate    - decides whether to review and collects failed CI logs and SonarQube
+#             findings (read-only token)
 #   review  - Claude and Codex take turns in throwaway containers with no network
 #             but an API proxy holding the turn's key (ai-review/ai_review_loop.sh).
 #             The job's token can only read the repository, and the runner's own
@@ -69,6 +70,14 @@ on:
         required: false
         type: string
         default: security/malicious-code-scan
+      sonar_project_key:
+        required: false
+        type: string
+        default: ""
+      sonar_wait_minutes:
+        required: false
+        type: string
+        default: ""
       shared_ref:
         required: false
         type: string
@@ -79,6 +88,8 @@ on:
       OPENAI_API_KEY:
         required: true
       AI_REVIEW_PUSH_TOKEN:
+        required: false
+      SONAR_TOKEN:
         required: false
 
 permissions:
@@ -96,6 +107,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       actions: read
+      checks: read
       contents: read
       pull-requests: read
       statuses: read
@@ -106,6 +118,7 @@ jobs:
       head_ref: ${{ steps.gate.outputs.head_ref }}
       base_ref: ${{ steps.gate.outputs.base_ref }}
       ci_failures: ${{ steps.gate.outputs.ci_failures }}
+      sonar_findings: ${{ steps.gate.outputs.sonar_findings }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
@@ -152,6 +165,9 @@ jobs:
           SCAN_CONTEXT: ${{ inputs.scan_status_context }}
           SCAN_WAIT_MINUTES: ${{ inputs.scan_wait_minutes || '10' }}
           MAX_CI_ROUNDS: ${{ inputs.max_ci_rounds || '3' }}
+          SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
+          SONAR_WAIT_MINUTES: ${{ inputs.sonar_wait_minutes || '10' }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           OUT_DIR: ${{ runner.temp }}/ai-review
         run: bash shared/ai-review/ai_review_gate.sh
 
@@ -160,7 +176,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ai-review-ci-failures
-          path: ${{ runner.temp }}/ai-review/ci_failures.md
+          path: |
+            ${{ runner.temp }}/ai-review/ci_failures.md
+            ${{ runner.temp }}/ai-review/sonar_findings.md
           retention-days: 1
           # A re-run of the job replaces the earlier attempt's
           overwrite: true
@@ -253,6 +271,8 @@ jobs:
           RESULT_DIR: ${{ runner.temp }}/ai-review-result
           CI_FAILURES_FILE: ${{ runner.temp }}/ai-review-ci/ci_failures.md
           CI_FAILURE_COUNT: ${{ needs.gate.outputs.ci_failures }}
+          SONAR_FINDINGS_FILE: ${{ runner.temp }}/ai-review-ci/sonar_findings.md
+          SONAR_FINDING_COUNT: ${{ needs.gate.outputs.sonar_findings }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
