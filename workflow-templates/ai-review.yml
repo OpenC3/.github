@@ -11,9 +11,10 @@
 #    GitHub substitutes it only when you start the workflow from the Actions tab; the
 #    literal matches no branch, which only adds skipped runs for pushes.
 # 3. Add ANTHROPIC_API_KEY and OPENAI_API_KEY to the repo (or org) secrets, and
-#    AI_REVIEW_PUSH_TOKEN so the reviewers' fixes are pushed: a GitHub App token (or
-#    fine-grained PAT) with contents:write and no workflows permission, so GitHub refuses
-#    a push that changes a workflow.
+#    AI_REVIEW_PUSH_TOKEN so the reviewers' fixes are published: a GitHub App token (or
+#    fine-grained PAT) with contents:write, pull-requests:write and no workflows permission,
+#    so GitHub refuses a push that changes a workflow. The fixes come as a PR into the
+#    reviewed PR's branch; set fix_mode: push to commit them straight onto that branch.
 # 4. Optionally describe what to look for in review_instructions.
 # 5. If the repo uses SonarQube Cloud, the reviewers also fix the PR's SonarQube findings. A
 #    private project needs SONAR_TOKEN in the secrets (a token that can browse the project).
@@ -63,6 +64,7 @@ jobs:
       # review_instructions: |  # Uncomment to add repository-specific guidance for the reviewers
       #   - Check that ...
       # max_turns: "6"  # Uncomment and update if needed
+      # fix_mode: push  # Uncomment to commit fixes onto the PR's branch instead of opening a fix PR
       # scan_wait_minutes: "10"  # Uncomment to wait longer for a scan still running once CI is done
       # claude_model: claude-opus-5-5  # Uncomment and update if needed
       # sonar_project_key: Org_repo  # Uncomment if the SonarQube check run does not link the project

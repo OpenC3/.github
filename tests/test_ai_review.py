@@ -74,6 +74,15 @@ if args[0] == 'workflow':
     sys.exit(0)
 if args[1:3] == ['-X', 'DELETE']:
     sys.exit(0)
+if args[0] == 'pr':
+    # Opens PR 2; `pr list` answers from the fixture "pr list --head" or "pr list --base"
+    if args[1] == 'create':
+        print('https://github.com/owner/repo/pull/2')
+    if args[1] != 'list':
+        sys.exit(0)
+    value = fixtures.get('pr list ' + ('--head' if '--head' in args else '--base'), [])
+    result = subprocess.run(['jq', '-r', args[args.index('--jq') + 1]], input=json.dumps(value), text=True)
+    sys.exit(result.returncode)
 path = args[1]
 if path == 'repos/owner/repo/statuses/test-head':
     fields = dict(arg.split('=', 1) for arg in args if '=' in arg)
@@ -638,7 +647,18 @@ class ReviewTests(unittest.TestCase):
         git("format-patch", "-q", "--binary", "-o", str(patches), f"{head}..HEAD")
         git("reset", "-q", "--hard", head)
 
-    def publish(self, repository, remote, head, status="converged", body="## AI adversarial review\n", token="tok"):
+    def publish(
+        self,
+        repository,
+        remote,
+        head,
+        status="converged",
+        body="## AI adversarial review\n",
+        token="tok",
+        mode="push",
+        head_ref="feature",
+    ):
+        self.fixtures_path.write_text(json.dumps(self.fixtures))
         result = self.directory / "result"
         (result / "patches").mkdir(parents=True, exist_ok=True)
         if status is not None:
@@ -648,7 +668,9 @@ class ReviewTests(unittest.TestCase):
         env = self.env | {
             "RESULT_DIR": str(result),
             "HEAD_SHA": head,
-            "HEAD_REF": "feature",
+            "HEAD_REF": head_ref,
+            "FIX_MODE": mode,
+            "PR_AUTHOR": "author",
             "COMMENT_FILE": str(self.directory / "comment.md"),
             "PUSH_TOKEN": token,
             "SECRETS": f"{token}\n{CLAUDE_KEY}\n",
@@ -679,6 +701,66 @@ class ReviewTests(unittest.TestCase):
             "2",
         )
         self.assertTrue(comment.startswith(f"<!-- ai-adversarial-review -->\n<!-- ai-review-sha: {head} -->\n"))
+
+    def pr_calls(self):
+        if not self.calls_path.exists():
+            return []
+        return [call for call in map(json.loads, self.calls_path.read_text().splitlines()) if call[0] == "pr"]
+
+    def test_publish_opens_a_fix_pr_by_default(self):
+        repository, remote, git, head = self.make_publish_repo()
+        self.fixtures["pr list --base"] = [
+            {"number": 7, "headRefName": "ai-review/pr-1-100"},
+            {"number": 8, "headRefName": "ai-review/pr-12-100"},
+            {"number": 9, "headRefName": "other"},
+        ]
+        self.fix_patches(git, head, ["echo fixed >> feature.py"])
+        body = "## AI adversarial review\n\n### Turn 1: Claude (commit abc1234)\n"
+        run, status, comment, pushed = self.publish(repository, remote, head, body=body, mode="pull_request")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(status, "converged")
+        # The PR's branch is left alone; the fixes are on a branch of their own
+        self.assertEqual(pushed, head)
+        fix = subprocess.check_output(["git", "rev-parse", "ai-review/pr-1-123"], cwd=remote, text=True).strip()
+        self.assertEqual(git("rev-list", "--count", f"{head}..{fix}"), "1")
+        calls = self.pr_calls()
+        create = next(call for call in calls if call[1] == "create")
+        self.assertEqual(create[create.index("--base") + 1], "feature")
+        self.assertEqual(create[create.index("--head") + 1], "ai-review/pr-1-123")
+        # Only the superseded fix PR of this PR is closed
+        self.assertEqual([call[2] for call in calls if call[1] == "close"], ["7"])
+        # The author is asked to review it
+        edit = next(call for call in calls if call[1] == "edit")
+        self.assertEqual(edit[edit.index("--add-reviewer") + 1], "author")
+        # The link sits under the heading, above the turns
+        self.assertTrue(
+            comment.startswith(
+                f"<!-- ai-adversarial-review -->\n<!-- ai-review-sha: {head} -->\n## AI adversarial review\n\n"
+                "> [!NOTE]\n> The fixes from this review are in https://github.com/owner/repo/pull/2"
+            ),
+            comment,
+        )
+        self.assertLess(comment.index("pull/2"), comment.index("### Turn 1"))
+
+    def test_publish_reuses_the_fix_pr_of_an_earlier_attempt(self):
+        repository, remote, git, head = self.make_publish_repo()
+        self.fixtures["pr list --head"] = [{"url": "https://github.com/owner/repo/pull/5"}]
+        self.fix_patches(git, head, ["echo fixed >> feature.py"])
+        run, _, comment, _ = self.publish(repository, remote, head, mode="pull_request")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertNotIn("create", [call[1] for call in self.pr_calls()])
+        self.assertIn("https://github.com/owner/repo/pull/5", comment)
+
+    def test_publish_pushes_fixes_to_a_fix_pr_branch(self):
+        repository, remote, git, head = self.make_publish_repo()
+        git("push", "-q", str(remote), "HEAD:refs/heads/ai-review/pr-1-100")
+        self.fix_patches(git, head, ["echo fixed >> feature.py"])
+        run, status, _, _ = self.publish(repository, remote, head, mode="pull_request", head_ref="ai-review/pr-1-100")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(status, "converged")
+        fix = subprocess.check_output(["git", "rev-parse", "ai-review/pr-1-100"], cwd=remote, text=True).strip()
+        self.assertNotEqual(fix, head)
+        self.assertEqual(self.pr_calls(), [])
 
     def test_publish_applies_fixes_to_crlf_files(self):
         repository, remote, git, _ = self.make_publish_repo()
@@ -935,6 +1017,7 @@ class ReviewTests(unittest.TestCase):
         result = self.run_shell(f'bash "{GATE}"')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs()["skip"], "false")
+        self.assertEqual(self.outputs()["author"], "author")
         self.fixtures["repos/owner/repo/actions/runs?head_sha=test-head&per_page=100"]["workflow_runs"][-1]["event"] = (
             "pull_request"
         )
