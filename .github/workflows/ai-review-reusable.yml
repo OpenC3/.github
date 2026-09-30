@@ -20,13 +20,18 @@
 #   SONAR_TOKEN           - SonarQube token that can browse the project (optional; only a private
 #                           project needs it). The gate collects the PR's SonarQube findings from
 #                           the SonarQube Cloud check run on the PR head for the reviewers to fix.
-#   AI_REVIEW_PUSH_TOKEN  - Token that pushes fixes: a GitHub App token (or fine-grained PAT) with
-#                           contents:write on this repository and no workflows permission, so
-#                           GitHub itself refuses a push that changes a workflow. Without it the
-#                           review still runs and comments, but fixes are not pushed: a
-#                           GITHUB_TOKEN push triggers neither CI nor the Malicious Code Scan, so
-#                           the required scan status would never report on the new head and the
-#                           PR could not merge until someone pushed again.
+#   AI_REVIEW_PUSH_TOKEN  - Token that publishes fixes: a GitHub App token (or fine-grained PAT) with
+#                           contents:write and pull-requests:write on this repository and no
+#                           workflows permission, so GitHub itself refuses a push that changes a
+#                           workflow. Without it the review still runs and comments, but fixes are
+#                           not published: a GITHUB_TOKEN push or PR triggers neither CI nor the
+#                           Malicious Code Scan, so the required scan status would never report on
+#                           the new head and it could not merge until someone pushed again.
+#
+# By default (fix_mode: pull_request) the fixes go on a new branch, ai-review/pr-<number>-<run id>,
+# with a PR from it into the PR's branch, so the author decides whether to take them; a newer fix
+# PR closes the one it supersedes. CI failures on a fix PR are fixed on its own branch. With
+# fix_mode: push the fixes are committed straight onto the PR's branch.
 #
 # The caller must grant the job actions: read, checks: read, contents: read, pull-requests: write
 # and statuses: read (without checks: read, SonarQube findings are left out). Add the `skip-ai-review` label to a PR to opt out. A manual run
@@ -110,6 +115,13 @@ on:
         required: false
         type: string
         default: ""
+      fix_mode:
+        description: >-
+          Where the reviewers' fixes go: pull_request (default) opens a PR with them from a new
+          branch into the PR's branch; push commits them straight onto the PR's branch
+        required: false
+        type: string
+        default: pull_request
       shared_ref:
         description: Ref of OpenC3/.github to take the scripts and prompt from; match the ref in `uses:` (ai-review-run.yml is always taken from main)
         required: false
@@ -206,6 +218,7 @@ jobs:
       scan_status_context: ${{ inputs.scan_status_context }}
       sonar_project_key: ${{ inputs.sonar_project_key }}
       sonar_wait_minutes: ${{ inputs.sonar_wait_minutes }}
+      fix_mode: ${{ inputs.fix_mode }}
       shared_ref: ${{ inputs.shared_ref }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

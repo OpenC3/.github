@@ -26,7 +26,7 @@
 #               project), SONAR_HOST_URL, SONAR_APP (the check run's app slug),
 #               SONAR_WAIT_MINUTES (how long to wait for a running analysis)
 #
-# Step outputs: skip, reason, pr, head_sha, head_ref, base_ref, ci_failures, sonar_findings
+# Step outputs: skip, reason, pr, author, head_sha, head_ref, base_ref, ci_failures, sonar_findings
 
 set -euo pipefail
 
@@ -299,6 +299,7 @@ fi
 echo "PR #$PR_NUMBER at $HEAD_SHA: $total CI run(s) complete, $failures CI failure(s), $sonar_findings SonarQube finding(s)"
 output skip false
 output pr "$PR_NUMBER"
+output author "$(pr_field .user.login)"
 output head_sha "$HEAD_SHA"
 output head_ref "$(pr_field .head.ref)"
 output base_ref "$(pr_field .base.ref)"

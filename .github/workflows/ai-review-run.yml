@@ -10,7 +10,8 @@
 #             The job's token can only read the repository, and the runner's own
 #             egress is limited to the endpoints the job needs.
 #   publish - on a fresh runner, checks the fix commits the review produced and
-#             pushes them, then posts the summary (ai-review/ai_review_publish.sh).
+#             publishes them (a fix PR, or a push with fix_mode: push), then posts the
+#             summary (ai-review/ai_review_publish.sh).
 #             It treats everything from the review job as untrusted data.
 #
 # Third party actions are pinned to a full commit SHA, because a tag can be moved
@@ -78,6 +79,10 @@ on:
         required: false
         type: string
         default: ""
+      fix_mode:
+        required: false
+        type: string
+        default: pull_request
       shared_ref:
         required: false
         type: string
@@ -114,6 +119,7 @@ jobs:
     outputs:
       skip: ${{ steps.gate.outputs.skip }}
       pr: ${{ steps.gate.outputs.pr }}
+      author: ${{ steps.gate.outputs.author }}
       head_sha: ${{ steps.gate.outputs.head_sha }}
       head_ref: ${{ steps.gate.outputs.head_ref }}
       base_ref: ${{ steps.gate.outputs.base_ref }}
@@ -329,13 +335,16 @@ jobs:
           name: ai-review-result
           path: ${{ runner.temp }}/ai-review-result
 
-      - name: Check and push fixes
+      - name: Check and publish fixes
         id: publish
         working-directory: repo
         env:
           RESULT_DIR: ${{ runner.temp }}/ai-review-result
           HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
           HEAD_REF: ${{ needs.gate.outputs.head_ref }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr }}
+          PR_AUTHOR: ${{ needs.gate.outputs.author }}
+          FIX_MODE: ${{ inputs.fix_mode }}
           COMMENT_FILE: ${{ runner.temp }}/comment.md
           PUSH_TOKEN: ${{ secrets.AI_REVIEW_PUSH_TOKEN }}
           SECRETS: |
