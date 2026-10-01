@@ -34,3 +34,4 @@ jobs:
       # python_version: '3.12'  # Uncomment and update if needed
       # ruby_version: '3.4'  # Uncomment and update if needed
       # require_tests: true  # Uncomment to fail the build when the plugin has no tests
+      # gemfile: Gemfile.dev  # Uncomment if the specs need a different Gemfile than the plugin's own
