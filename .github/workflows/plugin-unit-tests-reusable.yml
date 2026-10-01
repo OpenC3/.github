@@ -38,6 +38,11 @@ on:
         required: false
         type: boolean
         default: false
+      gemfile:
+        description: 'Gemfile for the Ruby specs, relative to plugin_directory (e.g. a Gemfile.dev that adds the test gems)'
+        required: false
+        type: string
+        default: 'Gemfile'
 
 permissions:
   contents: read
@@ -188,14 +193,26 @@ jobs:
           working-directory: ${{ inputs.plugin_directory }}
           # Caching bundler needs a lockfile to key on, and most plugins have no
           # Gemfile at all, in which case the gems are installed directly below
-          bundler-cache: ${{ hashFiles(format('{0}/Gemfile.lock', inputs.plugin_directory)) != '' }}
+          bundler-cache: ${{ hashFiles(format('{0}/{1}.lock', inputs.plugin_directory, inputs.gemfile)) != '' }}
+        env:
+          # Only set for a non-default gemfile, so the default keeps setup-ruby's own lookup
+          BUNDLE_GEMFILE: ${{ inputs.gemfile != 'Gemfile' && format('{0}/{1}/{2}', github.workspace, inputs.plugin_directory, inputs.gemfile) || '' }}
 
       - name: Install dependencies
         working-directory: ${{ inputs.plugin_directory }}
+        env:
+          GEMFILE: ${{ inputs.gemfile }}
         run: |
           set -euo pipefail
-          if [ -f Gemfile ]; then
+          if [ -f "$GEMFILE" ]; then
+            # Exported for the spec run too, and for a Rails app's config/boot.rb
+            export BUNDLE_GEMFILE="$PWD/$GEMFILE"
+            echo "BUNDLE_GEMFILE=$BUNDLE_GEMFILE" >> "$GITHUB_ENV"
             bundle install --jobs 4 --retry 3
+          elif [ "$GEMFILE" != "Gemfile" ]; then
+            # A gemfile that was asked for but is missing is a mistake, not a plugin without a Gemfile
+            echo "::error::gemfile '$GEMFILE' does not exist in ${{ inputs.plugin_directory }}"
+            exit 1
           else
             gem install --no-document rspec openc3
           fi
@@ -206,7 +223,7 @@ jobs:
           SPEC_DIR: ${{ needs.detect.outputs.ruby-dir }}
         run: |
           set -euo pipefail
-          if [ -f Gemfile ]; then
+          if [ -n "${BUNDLE_GEMFILE:-}" ]; then
             bundle exec rspec "$SPEC_DIR" --format documentation
           else
             rspec "$SPEC_DIR" --format documentation
