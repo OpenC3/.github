@@ -579,6 +579,10 @@ def deterministic_scan(base: str, head: str) -> tuple[list[Finding], str]:
 
 def metadata_scan(pr_title: str, pr_body: str) -> list[Finding]:
     findings: list[Finding] = []
+    # Zero-width spaces are common in descriptions (e.g. @<U+200B>name to avoid a mention) and hide
+    # nothing on their own. Drop them rather than allow them, so they cannot split a phrase the
+    # prompt-injection rules look for; the other zero-width characters still block.
+    pr_body = pr_body.replace("\u200b", "")
     for i, text in enumerate(f"{pr_title}\n{pr_body}".splitlines(), 1):
         scan_text("(PR title/description)", i, text, findings, code_rules=False)
     return findings
