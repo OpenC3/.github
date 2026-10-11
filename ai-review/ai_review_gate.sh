@@ -11,7 +11,7 @@
 # if purchased from OpenC3, Inc.
 
 # Decides whether the AI review loop should run for a PR and collects failed
-# CI job logs and SonarQube findings for the reviewers. Every CI workflow completion triggers the AI
+# CI job logs (but not Trivy scan failures) and SonarQube findings for the reviewers. Every CI workflow completion triggers the AI
 # Review workflow, so this lets only the run that sees all CI finished proceed.
 # The Malicious Code Scan does not trigger the review, so that run waits for a
 # scan still running on the PR head. A manual (workflow_dispatch) run fails
@@ -157,15 +157,42 @@ case "$scan_state" in
 esac
 
 # Collect failed job logs, with a workflow-level fallback for failures before jobs start.
+log_file="$(mktemp)"
+log_error="$(mktemp)"
+trap 'rm -f "$log_file" "$log_error"' EXIT
+# A job log ends with its post steps (harden-runner's cleanup alone runs to well over 100 lines),
+# so keep the last LOG_LINES before the last error ahead of them: the end of the step that failed.
+# Strip the timestamp prefix and ANSI colors, and cut very long lines, to save tokens.
+failed_step_log() {
+  sed -E 's/^\xef\xbb\xbf//; s/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z //; s/\x1b\[[0-9;]*m//g' \
+    | awk -v n="$LOG_LINES" '
+      /^Post job cleanup\.$/ { exit }
+      { line[NR] = $0; if (/^##\[error\]/) last = NR }
+      END {
+        stop = last ? last : NR
+        for (i = (stop > n ? stop - n + 1 : 1); i <= stop; i++) print substr(line[i], 1, 1000)
+      }'
+}
 failures=0
 while IFS=$'\t' read -r run_id run_name run_conclusion run_url; do
   [[ -n "$run_id" ]] || continue
   failures_before=$failures
+  ignored=0
+  # A job whose only failed steps are Trivy scans failed on a vulnerability in a base image or
+  # dependency, which a fix to the PR cannot address, so the reviewers never see it
+  # shellcheck disable=SC2016
   jobs="$(gh api "repos/$repo/actions/runs/$run_id/jobs" --paginate \
-    --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | [.id, .name, .html_url] | @tsv')" \
+    --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out")
+      | [.steps[]? | select(.conclusion == "failure" or .conclusion == "timed_out") | .name] as $failed
+      | [.id, .name, .html_url, ($failed != [] and all($failed[]; test("trivy"; "i")))] | @tsv')" \
     || jobs=""
-  while IFS=$'\t' read -r job_id job_name job_url; do
+  while IFS=$'\t' read -r job_id job_name job_url trivy_only; do
     [[ -n "$job_id" ]] || continue
+    if [[ "$trivy_only" == "true" ]]; then
+      echo "::notice::Ignoring $run_name / $job_name: only its Trivy scan failed"
+      ignored=$((ignored + 1))
+      continue
+    fi
     failures=$((failures + 1))
     {
       echo "### $run_name / $job_name"
@@ -173,15 +200,18 @@ while IFS=$'\t' read -r run_id run_name run_conclusion run_url; do
       echo "$job_url"
       echo
       echo '```'
-      # Strip the timestamp prefix and ANSI colors to save tokens
-      gh api "repos/$repo/actions/jobs/$job_id/logs" 2> /dev/null \
-        | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z //; s/\x1b\[[0-9;]*m//g' \
-        | tail -n "$LOG_LINES" || echo "(log unavailable)"
+      if gh api "repos/$repo/actions/jobs/$job_id/logs" > "$log_file" 2> "$log_error"; then
+        failed_step_log < "$log_file"
+      else
+        error="$(tr -s '\n' ' ' < "$log_error" | sed 's/ *$//' | cut -c1-300)"
+        echo "::warning::Could not download the log of $run_name / $job_name: ${error:-unknown error}" >&2
+        echo "(log unavailable: ${error:-unknown error})"
+      fi
       echo '```'
       echo
     } >> "$CI_FILE"
   done <<< "$jobs"
-  if (( failures == failures_before )); then
+  if (( failures == failures_before && ignored == 0 )); then
     failures=$((failures + 1))
     {
       echo "### $run_name / workflow failure"
