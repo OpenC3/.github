@@ -1041,6 +1041,42 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("::warning::Could not download the log of", result.stderr)
         self.assertIn("(log unavailable: test API error)", (self.directory / "out/ci_failures.md").read_text())
 
+    def test_trivy_scan_failures_are_ignored(self):
+        def job(job_id, *failed_steps):
+            steps = [{"name": "Build", "conclusion": "success"}]
+            steps += [{"name": name, "conclusion": "failure"} for name in failed_steps]
+            return {
+                "id": job_id,
+                "name": f"job {job_id}",
+                "conclusion": "failure",
+                "html_url": f"https://example.invalid/job/{job_id}",
+                "steps": steps,
+            }
+
+        self.fixtures["repos/owner/repo/actions/runs/123/jobs"] = {
+            "jobs": [job(10, "Run Trivy on image ruby", "Run trivy on image node")]
+        }
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The head is an AI review fix, so a scan failure alone does not send it back for another round
+        self.assertEqual(self.outputs()["skip"], "true")
+        self.assertIn("CI passed", self.outputs()["reason"])
+        self.assertEqual((self.directory / "out/ci_failures.md").read_text(), "")
+        self.assertIn("Ignoring Python Lint / job 10", result.stdout)
+
+        # A failure besides the scan still reaches the reviewers
+        self.fixtures["repos/owner/repo/actions/runs/123/jobs"] = {
+            "jobs": [job(10, "Run Trivy on image ruby"), job(11, "Run Trivy on image ruby", "Build images")]
+        }
+        self.fixtures["repos/owner/repo/actions/jobs/11/logs"] = "The build broke"
+        self.outputs_path.unlink()
+        result = self.run_shell(f'bash "{GATE}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["ci_failures"], "1")
+        report = (self.directory / "out/ci_failures.md").read_text()
+        self.assertIn("The build broke", report)
+        self.assertNotIn("job 10", report)
+
     def test_pending_builtin_run_does_not_block_review(self):
         runs = self.fixtures["repos/owner/repo/actions/runs?head_sha=test-head&per_page=100"]["workflow_runs"]
         runs.append({"id": 124, "name": "CodeQL", "event": "dynamic", "status": "in_progress", "conclusion": None})
@@ -1235,7 +1271,7 @@ class ReviewTests(unittest.TestCase):
         self.outputs_path.unlink()
         result = self.run_shell(f'bash "{GATE}"')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.outputs()["skip"], "false")
+        self.assertEqual(self.outputs()["skip"], "false", self.outputs().get("reason"))
         self.assertEqual(self.outputs()["ci_failures"], "0")
 
     def test_loop_hands_sonarqube_findings_to_the_reviewers(self):

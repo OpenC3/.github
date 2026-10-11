@@ -11,7 +11,7 @@
 # if purchased from OpenC3, Inc.
 
 # Decides whether the AI review loop should run for a PR and collects failed
-# CI job logs and SonarQube findings for the reviewers. Every CI workflow completion triggers the AI
+# CI job logs (but not Trivy scan failures) and SonarQube findings for the reviewers. Every CI workflow completion triggers the AI
 # Review workflow, so this lets only the run that sees all CI finished proceed.
 # The Malicious Code Scan does not trigger the review, so that run waits for a
 # scan still running on the PR head. A manual (workflow_dispatch) run fails
@@ -177,11 +177,22 @@ failures=0
 while IFS=$'\t' read -r run_id run_name run_conclusion run_url; do
   [[ -n "$run_id" ]] || continue
   failures_before=$failures
+  ignored=0
+  # A job whose only failed steps are Trivy scans failed on a vulnerability in a base image or
+  # dependency, which a fix to the PR cannot address, so the reviewers never see it
+  # shellcheck disable=SC2016
   jobs="$(gh api "repos/$repo/actions/runs/$run_id/jobs" --paginate \
-    --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | [.id, .name, .html_url] | @tsv')" \
+    --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out")
+      | [.steps[]? | select(.conclusion == "failure" or .conclusion == "timed_out") | .name] as $failed
+      | [.id, .name, .html_url, ($failed != [] and all($failed[]; test("trivy"; "i")))] | @tsv')" \
     || jobs=""
-  while IFS=$'\t' read -r job_id job_name job_url; do
+  while IFS=$'\t' read -r job_id job_name job_url trivy_only; do
     [[ -n "$job_id" ]] || continue
+    if [[ "$trivy_only" == "true" ]]; then
+      echo "::notice::Ignoring $run_name / $job_name: only its Trivy scan failed"
+      ignored=$((ignored + 1))
+      continue
+    fi
     failures=$((failures + 1))
     {
       echo "### $run_name / $job_name"
@@ -200,7 +211,7 @@ while IFS=$'\t' read -r run_id run_name run_conclusion run_url; do
       echo
     } >> "$CI_FILE"
   done <<< "$jobs"
-  if (( failures == failures_before )); then
+  if (( failures == failures_before && ignored == 0 )); then
     failures=$((failures + 1))
     {
       echo "### $run_name / workflow failure"
