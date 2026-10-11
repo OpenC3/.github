@@ -157,6 +157,22 @@ case "$scan_state" in
 esac
 
 # Collect failed job logs, with a workflow-level fallback for failures before jobs start.
+log_file="$(mktemp)"
+log_error="$(mktemp)"
+trap 'rm -f "$log_file" "$log_error"' EXIT
+# A job log ends with its post steps (harden-runner's cleanup alone runs to well over 100 lines),
+# so keep the last LOG_LINES before the last error ahead of them: the end of the step that failed.
+# Strip the timestamp prefix and ANSI colors, and cut very long lines, to save tokens.
+failed_step_log() {
+  sed -E 's/^\xef\xbb\xbf//; s/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z //; s/\x1b\[[0-9;]*m//g' \
+    | awk -v n="$LOG_LINES" '
+      /^Post job cleanup\.$/ { exit }
+      { line[NR] = $0; if (/^##\[error\]/) last = NR }
+      END {
+        stop = last ? last : NR
+        for (i = (stop > n ? stop - n + 1 : 1); i <= stop; i++) print substr(line[i], 1, 1000)
+      }'
+}
 failures=0
 while IFS=$'\t' read -r run_id run_name run_conclusion run_url; do
   [[ -n "$run_id" ]] || continue
@@ -173,10 +189,13 @@ while IFS=$'\t' read -r run_id run_name run_conclusion run_url; do
       echo "$job_url"
       echo
       echo '```'
-      # Strip the timestamp prefix and ANSI colors to save tokens
-      gh api "repos/$repo/actions/jobs/$job_id/logs" 2> /dev/null \
-        | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z //; s/\x1b\[[0-9;]*m//g' \
-        | tail -n "$LOG_LINES" || echo "(log unavailable)"
+      if gh api "repos/$repo/actions/jobs/$job_id/logs" > "$log_file" 2> "$log_error"; then
+        failed_step_log < "$log_file"
+      else
+        error="$(tr -s '\n' ' ' < "$log_error" | sed 's/ *$//' | cut -c1-300)"
+        echo "::warning::Could not download the log of $run_name / $job_name: ${error:-unknown error}" >&2
+        echo "(log unavailable: ${error:-unknown error})"
+      fi
       echo '```'
       echo
     } >> "$CI_FILE"
