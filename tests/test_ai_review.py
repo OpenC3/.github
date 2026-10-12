@@ -715,7 +715,11 @@ class ReviewTests(unittest.TestCase):
             {"number": 8, "headRefName": "ai-review/pr-12-100"},
             {"number": 9, "headRefName": "other"},
         ]
-        self.fix_patches(git, head, ["echo fixed >> feature.py"])
+        message = (
+            "fix(review): apply Claude review fixes (turn 1)\n\n- feature.py:1 - <!-- hidden --> printed the wrong value\n\n"
+            "AI-Review-Bot: true\nAI-Review-Run: 456"
+        )
+        self.fix_patches(git, head, ["echo fixed >> feature.py"], message=message)
         body = "## AI adversarial review\n\n### Turn 1: Claude (commit abc1234)\n"
         run, status, comment, pushed = self.publish(repository, remote, head, body=body, mode="pull_request")
         self.assertEqual(run.returncode, 0, run.stderr)
@@ -728,6 +732,12 @@ class ReviewTests(unittest.TestCase):
         create = next(call for call in calls if call[1] == "create")
         self.assertEqual(create[create.index("--base") + 1], "feature")
         self.assertEqual(create[create.index("--head") + 1], "ai-review/pr-1-123")
+        # The fix PR describes its changes rather than only pointing back at the reviewed PR
+        pr_body = create[create.index("--body") + 1]
+        self.assertIn("### What changed", pr_body)
+        self.assertIn("**fix(review): apply Claude review fixes (turn 1)**", pr_body)
+        self.assertIn("- feature.py:1 - &lt;!-- hidden --> printed the wrong value", pr_body)
+        self.assertNotIn("AI-Review-Bot", pr_body)
         # Only the superseded fix PR of this PR is closed
         self.assertEqual([call[2] for call in calls if call[1] == "close"], ["7"])
         # The author is asked to review it
