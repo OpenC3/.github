@@ -116,6 +116,19 @@ apply_fixes() {
 
 remote="https://x-access-token:${PUSH_TOKEN:-}@github.com/${GITHUB_REPOSITORY}.git"
 
+# Describes the fix PR: each fix commit's subject and the fixes its message lists (apply_fixes
+# already checked the messages for secrets). Comment openers are escaped so nothing in the agents'
+# text is hidden from the reader, and it stays under GitHub's limit.
+fix_pr_body() {
+  local commit body
+  body="Fixes from the AI review of #${PR_NUMBER} at ${HEAD_SHA}. Merge this PR to apply them to \`${HEAD_REF}\`; the full review summary is on #${PR_NUMBER}."$'\n\n'"### What changed"$'\n'
+  for commit in $(git rev-list --reverse "$HEAD_SHA..HEAD"); do
+    body+=$'\n'"$(git log -1 --format='**%s**' "$commit")"$'\n'
+    body+="$(git log -1 --format=%b "$commit" | grep '^- ' || true)"$'\n'
+  done
+  printf '%s' "${body:0:60000}" | sed 's/<!--/\&lt;!--/g'
+}
+
 # Pushes the fixes to a branch of their own and opens a PR from it into HEAD_REF; prints what it
 # did, or why it failed. The PR is opened with PUSH_TOKEN: one opened with GITHUB_TOKEN would start
 # neither CI nor the Malicious Code Scan.
@@ -129,9 +142,7 @@ open_fix_pr() {
   export GH_TOKEN="$PUSH_TOKEN"
   url="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json url --jq '.[0].url // empty' 2> /dev/null || true)"
   if [[ -z "$url" ]]; then
-    body="$(printf '%s\n' \
-      "Fixes from the AI review of #${PR_NUMBER} at ${HEAD_SHA}. Merge this PR to apply them to \`${HEAD_REF}\`; the review summary is on #${PR_NUMBER}." \
-      "" "$(git log --reverse --format='- %s' "$HEAD_SHA..HEAD")")"
+    body="$(fix_pr_body)"
     if ! url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$HEAD_REF" --head "$branch" \
       --title "AI review fixes for #${PR_NUMBER}" --body "$body" 2> /dev/null | tail -n 1)" || [[ -z "$url" ]]; then
       echo "the fix PR from $branch could not be opened (does AI_REVIEW_PUSH_TOKEN have pull-requests:write?)"
