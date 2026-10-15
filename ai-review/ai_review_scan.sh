@@ -18,8 +18,9 @@
 # Blocking findings stop the review: the PR's AI review comment says so (with a marker the gate
 # reads, so later CI completions do not pay for the same scan again) and the step fails. A
 # maintainer (write access or above) accepts them by adding the `malicious-scan-override` label
-# after that comment, then running AI Review by hand. A label added before the comment covers an
-# earlier commit, not this one, and is removed.
+# after that comment, then running AI Review by hand. The label is the approval, so any later run
+# for this commit accepts it, including one started by a CI completion. A label added before the
+# comment covers an earlier commit, not this one, and is removed.
 #
 # Required env: GH_TOKEN, GITHUB_REPOSITORY, PR_NUMBER, HEAD_SHA, SCANNER (path to the scanner)
 # Optional env: ANTHROPIC_API_KEY and the scanner's SCAN_* settings, GITHUB_SERVER_URL,

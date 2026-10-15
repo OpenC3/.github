@@ -15,7 +15,8 @@
 #
 # Blocking scan findings stop the review and are reported on the PR. A maintainer
 # (write access or above) accepts them by adding the `malicious-scan-override`
-# label and running the review by hand; a new push is scanned again.
+# label and running the review by hand (a later CI completion for that commit also goes ahead);
+# a new push is scanned again.
 #
 # Secrets:
 #   ANTHROPIC_API_KEY     - Claude API key, for the review and the scan (required)

@@ -20,7 +20,8 @@
 # 6. Create a `malicious-scan-override` label. When the scan blocks a PR, the review does not
 #    run and the PR's AI review comment says why (the findings are in the run's summary). A
 #    maintainer with write access who has checked them adds the label, then runs this workflow
-#    by hand for the PR. A new push is scanned again.
+#    by hand for the PR (a later CI completion for the same commit also goes ahead). A new push
+#    is scanned again.
 #
 # Add the `skip-ai-review` label to a PR to opt out. Changes to this file take effect once
 # they are on the default branch.
