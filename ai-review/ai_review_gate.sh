@@ -13,15 +13,14 @@
 # Decides whether the AI review loop should run for a PR and collects failed
 # CI job logs (but not Trivy scan failures) and SonarQube findings for the reviewers. Every CI workflow completion triggers the AI
 # Review workflow, so this lets only the run that sees all CI finished proceed.
-# The Malicious Code Scan does not trigger the review, so that run waits for a
-# scan still running on the PR head. A manual (workflow_dispatch) run fails
-# instead of skipping, so it is not mistaken for a review that passed.
+# The malicious code scan comes after this, in its own job (ai_review_scan.sh).
+# A manual (workflow_dispatch) run fails instead of skipping, so it is not
+# mistaken for a review that passed.
 #
 # Required env: GH_TOKEN, GITHUB_REPOSITORY, EVENT_NAME, OUT_DIR
 # One of: PR_NUMBER, HEAD_SHA
-# Optional env: FORCE (review even if this commit was already reviewed), REVIEW_WORKFLOW,
-#               SCAN_WORKFLOW, SCAN_CONTEXT, MAX_CI_ROUNDS, LOG_LINES,
-#               SCAN_WAIT_MINUTES (how long to wait for a running scan), SCAN_POLL_SECONDS,
+# Optional env: FORCE (review even if this commit was already reviewed or blocked by the scan),
+#               REVIEW_WORKFLOW, MAX_CI_ROUNDS, LOG_LINES, POLL_SECONDS,
 #               SONAR_PROJECT_KEY (default: from the SonarQube check run), SONAR_TOKEN (for a private
 #               project), SONAR_HOST_URL, SONAR_APP (the check run's app slug),
 #               SONAR_WAIT_MINUTES (how long to wait for a running analysis)
@@ -35,12 +34,9 @@ set -euo pipefail
 : "${OUT_DIR:?}"
 
 REVIEW_WORKFLOW="${REVIEW_WORKFLOW:-AI Review}"
-SCAN_WORKFLOW="${SCAN_WORKFLOW:-Malicious Code Scan}"
-SCAN_CONTEXT="${SCAN_CONTEXT:-security/malicious-code-scan}"
 FORCE="${FORCE:-false}"
 MAX_CI_ROUNDS="${MAX_CI_ROUNDS:-3}"
-SCAN_WAIT_MINUTES="${SCAN_WAIT_MINUTES:-10}"
-SCAN_POLL_SECONDS="${SCAN_POLL_SECONDS:-30}"
+POLL_SECONDS="${POLL_SECONDS:-30}"
 LOG_LINES="${LOG_LINES:-150}"
 SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-}"
 SONAR_HOST_URL="${SONAR_HOST_URL:-https://sonarcloud.io}"
@@ -94,7 +90,7 @@ HEAD_SHA="$pr_head"
 
 # Paginate: every CI completion adds an AI Review run for this commit, which can push CI runs off page one
 runs="$(gh api "repos/$repo/actions/runs?head_sha=$HEAD_SHA&per_page=100" --paginate \
-  --jq ".workflow_runs[] | select(.name != \"$REVIEW_WORKFLOW\" and .name != \"$SCAN_WORKFLOW\")" | jq -s .)"
+  --jq ".workflow_runs[] | select(.name != \"$REVIEW_WORKFLOW\")" | jq -s .)"
 total="$(jq length <<< "$runs")"
 # Only pull_request runs start this review when they finish (the pr job drops the rest), so waiting on
 # a push or built-in (dynamic, e.g. CodeQL default setup) run that finishes last would never start it.
@@ -105,56 +101,21 @@ if (( total == 0 )) && [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
 fi
 (( pending == 0 )) || skip "$pending of $total CI run(s) for $HEAD_SHA still in progress"
 
-marker="<!-- ai-review-sha: $HEAD_SHA -->"
-# Only the workflow's own summary can attest that this commit was reviewed.
-if [[ "$FORCE" != "true" ]] &&
-  gh api "repos/$repo/issues/$PR_NUMBER/comments" --paginate --jq '
-    .[] | select(.user.login == "github-actions[bot]" and .user.type == "Bot")
-    | .body | select(startswith("<!-- ai-adversarial-review -->"))' | grep -F "$marker" > /dev/null; then
-  skip "$HEAD_SHA was already reviewed"
-fi
-
-# Never hand a PR to agents holding secrets and a write token until the malicious code scan passes.
-# Nothing triggers this review when the scan finishes, so if CI finished first, wait for it here.
-scan_status() {
-  gh api "repos/$repo/commits/$HEAD_SHA/status" --paginate \
-    --jq ".statuses[] | select(.context == \"$SCAN_CONTEXT\")" | jq -s '.[0] // {}'
-}
-# The scan marks the commit pending when it starts; before then (queued for a runner, or behind
-# the scan of an earlier push) there is only its run. Any unfinished scan in the repository counts,
-# which at worst waits out SCAN_WAIT_MINUTES for a PR that has no scan coming.
-scan_queued() {
-  gh api "repos/$repo/actions/runs?event=pull_request_target&per_page=20" \
-    --jq "[.workflow_runs[] | select(.name == \"$SCAN_WORKFLOW\" and .status != \"completed\")] | length"
-}
-deadline=$((SECONDS + SCAN_WAIT_MINUTES * 60))
-while true; do
-  scan_status="$(scan_status)"
-  scan_state="$(jq -r '.state // ""' <<< "$scan_status")"
-  [[ "$scan_state" == "pending" || ( -z "$scan_state" && "$(scan_queued)" != "0" ) ]] || break
-  (( SECONDS < deadline )) || break
-  # A push abandons the scan of this commit, which then never reports
-  [[ "$(gh api "repos/$repo/pulls/$PR_NUMBER" --jq .head.sha)" == "$HEAD_SHA" ]] ||
-    skip "the PR head moved past $HEAD_SHA while waiting for the malicious code scan"
-  echo "Waiting for the malicious code scan on $HEAD_SHA (${scan_state:-queued})"
-  sleep "$SCAN_POLL_SECONDS"
-done
-# Status URLs are caller-controlled. Require the trusted scan run's artifact to attest the exact
-# status ID, PR and head, so pointing a forged status at an old passing run cannot authorize review.
-if [[ "$scan_state" == "success" ]]; then
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if ! python3 "$script_dir/../malicious-code-scan/scan_record.py" \
-    --workflow "$SCAN_WORKFLOW" --pr "$PR_NUMBER" --head "$HEAD_SHA" --context "$SCAN_CONTEXT" \
-    --state success <<< "$scan_status" > /dev/null; then
-    skip "the malicious code scan status on $HEAD_SHA has no verified record from a passing $SCAN_WORKFLOW run; run $SCAN_WORKFLOW for PR #$PR_NUMBER from the Actions tab"
+# Only the workflow's own summary can attest that this commit was reviewed, or that the malicious
+# code scan (run by this workflow once the gate passes) blocked it
+summaries="$(gh api "repos/$repo/issues/$PR_NUMBER/comments" --paginate --jq '
+  .[] | select(.user.login == "github-actions[bot]" and .user.type == "Bot")
+  | .body | select(startswith("<!-- ai-adversarial-review -->"))')"
+if [[ "$FORCE" != "true" ]]; then
+  if grep -qF "<!-- ai-review-sha: $HEAD_SHA -->" <<< "$summaries"; then
+    skip "$HEAD_SHA was already reviewed"
+  fi
+  # Scanning it again would only bill the same Claude review; a maintainer's override label lets it through
+  if grep -qF "<!-- ai-review-scan-blocked: $HEAD_SHA -->" <<< "$summaries" &&
+    ! jq -e 'any(.labels[]; .name == "malicious-scan-override")' <<< "$pr" > /dev/null; then
+    skip "the malicious code scan blocked $HEAD_SHA; a maintainer can add the malicious-scan-override label and run AI Review for PR #$PR_NUMBER by hand"
   fi
 fi
-case "$scan_state" in
-  success) ;;
-  "") skip "the malicious code scan has not reported on $HEAD_SHA; run $SCAN_WORKFLOW for PR #$PR_NUMBER from the Actions tab" ;;
-  pending) skip "the malicious code scan was still running on $HEAD_SHA after ${SCAN_WAIT_MINUTES} minute(s); run AI Review by hand once it passes" ;;
-  *) skip "the malicious code scan blocked $HEAD_SHA ($scan_state)" ;;
-esac
 
 # Collect failed job logs, with a workflow-level fallback for failures before jobs start.
 log_file="$(mktemp)"
@@ -250,7 +211,7 @@ while [[ "$(jq -r '.status // "completed"' <<< "$sonar")" != "completed" ]] && (
   [[ "$(gh api "repos/$repo/pulls/$PR_NUMBER" --jq .head.sha)" == "$HEAD_SHA" ]] ||
     skip "the PR head moved past $HEAD_SHA while waiting for the SonarQube analysis"
   echo "Waiting for the SonarQube analysis on $HEAD_SHA ($(jq -r .status <<< "$sonar"))"
-  sleep "$SCAN_POLL_SECONDS"
+  sleep "$POLL_SECONDS"
   sonar="$(sonar_check)" || sonar='{}'
 done
 sonar_status="$(jq -r '.status // ""' <<< "$sonar")"

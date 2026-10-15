@@ -130,8 +130,8 @@ fix_pr_body() {
 }
 
 # Pushes the fixes to a branch of their own and opens a PR from it into HEAD_REF; prints what it
-# did, or why it failed. The PR is opened with PUSH_TOKEN: one opened with GITHUB_TOKEN would start
-# neither CI nor the Malicious Code Scan.
+# did, or why it failed. The PR is opened with PUSH_TOKEN: one opened with GITHUB_TOKEN would not
+# start CI, so its fixes would never be checked or reviewed.
 open_fix_pr() {
   local branch="${FIX_BRANCH_PREFIX}${PR_NUMBER}-${GITHUB_RUN_ID:-local}" url body old
   # Only this run makes a branch of this name, so a rerun of the job may replace it

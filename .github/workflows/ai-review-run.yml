@@ -5,6 +5,11 @@
 #
 #   gate    - decides whether to review and collects failed CI logs and SonarQube
 #             findings (read-only token)
+#   scan    - scans the PR for obfuscated code, prompt injection, and other
+#             malicious changes (ai-review/ai_review_scan.sh); blocking findings stop
+#             the review before any agent sees the PR. The PR is never checked out or
+#             run here: its commits are fetched and read with git diff as data. Do not
+#             add steps that run code from the PR.
 #   review  - Claude and Codex take turns in throwaway containers with no network
 #             but an API proxy holding the turn's key (ai-review/ai_review_loop.sh).
 #             The job's token can only read the repository, and the runner's own
@@ -59,18 +64,14 @@ on:
         required: false
         type: string
         default: ""
-      scan_workflow_name:
-        required: false
-        type: string
-        default: Malicious Code Scan
-      scan_wait_minutes:
+      scan_project_description:
         required: false
         type: string
         default: ""
-      scan_status_context:
+      scan_generated_paths:
         required: false
         type: string
-        default: security/malicious-code-scan
+        default: ""
       sonar_project_key:
         required: false
         type: string
@@ -108,14 +109,13 @@ jobs:
   gate:
     name: Wait for CI and collect failures
     runs-on: ubuntu-latest
-    # Leaves room for the wait on the scan (SCAN_WAIT_MINUTES) and collecting CI logs
+    # Leaves room for the wait on SonarQube (SONAR_WAIT_MINUTES) and collecting CI logs
     timeout-minutes: 30
     permissions:
       actions: read
       checks: read
       contents: read
       pull-requests: read
-      statuses: read
     outputs:
       skip: ${{ steps.gate.outputs.skip }}
       pr: ${{ steps.gate.outputs.pr }}
@@ -135,9 +135,7 @@ jobs:
         with:
           repository: OpenC3/.github
           ref: ${{ inputs.shared_ref }}
-          sparse-checkout: |
-            ai-review
-            malicious-code-scan
+          sparse-checkout: ai-review
           path: shared
           persist-credentials: false
 
@@ -167,9 +165,6 @@ jobs:
           FORCE: ${{ inputs.force }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           REVIEW_WORKFLOW: ${{ github.workflow }}
-          SCAN_WORKFLOW: ${{ inputs.scan_workflow_name }}
-          SCAN_CONTEXT: ${{ inputs.scan_status_context }}
-          SCAN_WAIT_MINUTES: ${{ inputs.scan_wait_minutes || '10' }}
           MAX_CI_ROUNDS: ${{ inputs.max_ci_rounds || '3' }}
           SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
           SONAR_WAIT_MINUTES: ${{ inputs.sonar_wait_minutes || '10' }}
@@ -189,10 +184,66 @@ jobs:
           # A re-run of the job replaces the earlier attempt's
           overwrite: true
 
-  review:
-    name: Review
+  scan:
+    name: Malicious code scan
     needs: gate
     if: needs.gate.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write # say on the PR why it was not reviewed, and remove a stale override label
+    outputs:
+      passed: ${{ steps.scan.outputs.passed }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      # The trusted scanner
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OpenC3/.github
+          ref: ${{ inputs.shared_ref }}
+          sparse-checkout: |
+            ai-review
+            malicious-code-scan
+          path: shared
+          persist-credentials: false
+
+      # Base branch only, for its history; the PR is fetched into it as data
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.base_ref }}
+          path: repo
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.5"
+          python-version: "3.12"
+
+      - name: Scan
+        id: scan
+        working-directory: repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr }}
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          SCANNER: ${{ github.workspace }}/shared/malicious-code-scan/malicious_code_scan.py
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SCAN_CLAUDE_MODEL: ${{ inputs.claude_model }}
+          SCAN_PROJECT_DESCRIPTION: ${{ inputs.scan_project_description }}
+          SCAN_GENERATED_PATHS: ${{ inputs.scan_generated_paths }}
+        run: bash ../shared/ai-review/ai_review_scan.sh
+
+  review:
+    name: Review
+    needs: [gate, scan]
+    if: needs.gate.outputs.skip == 'false' && needs.scan.outputs.passed == 'true'
     runs-on: ubuntu-latest
     # The loop stops its turns after its TIME_LIMIT_MINUTES (75 by default), leaving time for the other steps
     timeout-minutes: 90
@@ -296,8 +347,8 @@ jobs:
 
   publish:
     name: Publish
-    needs: [gate, review]
-    # Also after a failed review, so the PR hears about it
+    needs: [gate, scan, review]
+    # Also after a failed review, so the PR hears about it (a blocked scan has said so itself)
     if: >-
       !cancelled() && needs.gate.outputs.skip == 'false' &&
       needs.review.result != 'skipped' && needs.review.outputs.stale != 'true'

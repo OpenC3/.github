@@ -1,21 +1,25 @@
-# Adversarial AI review: once every CI run for the PR head has finished and the
-# Malicious Code Scan has passed (see malicious-code-scan-reusable.yml), Claude
-# and Codex take turns reviewing the PR, fixing CI failures and other issues,
-# and committing fixes until one of them approves without changes. This
-# workflow finds the PR and queues its reviews; ai-review-run.yml does the
-# review itself, split across runners so the agents never share one with a
-# token that can write (see that file).
+# Adversarial AI review: once every CI run for the PR head has finished, the PR
+# is scanned for malicious changes (malicious-code-scan/malicious_code_scan.py)
+# and, if the scan passes, Claude and Codex take turns reviewing the PR, fixing
+# CI failures and other issues, and committing fixes until one of them approves
+# without changes. This workflow finds the PR and queues its reviews;
+# ai-review-run.yml does the scan and the review itself, split across runners so
+# the agents never share one with a token that can write (see that file).
 #
 # Called from workflow-templates/ai-review.yml, which a repository copies in and
 # triggers on workflow_run (once per completed CI workflow) and on
 # workflow_dispatch (by hand). The gate lets only the run that sees all CI
-# finished go ahead, and waits there for a Malicious Code Scan still running.
-# The scan does not start the review itself. workflow_run only uses the
-# caller's copy on its default branch, and the scripts and prompt come from this
-# repository, so a PR cannot change how it is reviewed.
+# finished go ahead. workflow_run only uses the caller's copy on its default
+# branch, and the scripts, scanner and prompt come from this repository, so a PR
+# cannot change how it is scanned or reviewed.
+#
+# Blocking scan findings stop the review and are reported on the PR. A maintainer
+# (write access or above) accepts them by adding the `malicious-scan-override`
+# label and running the review by hand (a later CI completion for that commit also goes ahead);
+# a new push is scanned again.
 #
 # Secrets:
-#   ANTHROPIC_API_KEY     - Claude API key (required)
+#   ANTHROPIC_API_KEY     - Claude API key, for the review and the scan (required)
 #   OPENAI_API_KEY        - Codex / OpenAI API key (required)
 #   SONAR_TOKEN           - SonarQube token that can browse the project (optional; only a private
 #                           project needs it). The gate collects the PR's SonarQube findings from
@@ -24,18 +28,17 @@
 #                           contents:write and pull-requests:write on this repository and no
 #                           workflows permission, so GitHub itself refuses a push that changes a
 #                           workflow. Without it the review still runs and comments, but fixes are
-#                           not published: a GITHUB_TOKEN push or PR triggers neither CI nor the
-#                           Malicious Code Scan, so the required scan status would never report on
-#                           the new head and it could not merge until someone pushed again.
+#                           not published: a GITHUB_TOKEN push or PR does not trigger CI, so the
+#                           fixes would never be checked or reviewed.
 #
 # By default (fix_mode: pull_request) the fixes go on a new branch, ai-review/pr-<number>-<run id>,
 # with a PR from it into the PR's branch, so the author decides whether to take them; a newer fix
 # PR closes the one it supersedes. CI failures on a fix PR are fixed on its own branch. With
 # fix_mode: push the fixes are committed straight onto the PR's branch.
 #
-# The caller must grant the job actions: read, checks: read, contents: read, pull-requests: write
-# and statuses: read (without checks: read, SonarQube findings are left out). Add the `skip-ai-review` label to a PR to opt out. A manual run
-# fails when it cannot review, so it is not mistaken for a review that passed.
+# The caller must grant the job actions: read, checks: read, contents: read and pull-requests: write
+# (without checks: read, SonarQube findings are left out). Add the `skip-ai-review` label to a PR to
+# opt out. A manual run fails when it cannot review, so it is not mistaken for a review that passed.
 #
 # Third party actions are pinned to a full commit SHA, because a tag can be moved
 # to point at different code. The comment after each pin records the tag it was.
@@ -71,7 +74,7 @@ on:
         type: string
         default: ""
       claude_model:
-        description: Claude model (default claude-opus-5-5)
+        description: Claude model, for the review and the scan (default claude-opus-5-5)
         required: false
         type: string
         default: ""
@@ -90,21 +93,19 @@ on:
         required: false
         type: string
         default: ""
-      scan_workflow_name:
-        description: Name of the caller's Malicious Code Scan workflow, which the gate waits on through its status instead of as CI
-        required: false
-        type: string
-        default: Malicious Code Scan
-      scan_wait_minutes:
-        description: How long the gate waits for a scan still running on the PR head once CI is done (default 10)
+      scan_project_description:
+        description: What the repository is, for the malicious code scan's Claude review (default names the repository)
         required: false
         type: string
         default: ""
-      scan_status_context:
-        description: Commit status the Malicious Code Scan reports, which must be success
+      scan_generated_paths:
+        description: >-
+          Committed build output, as git :(glob) patterns one per line (e.g. docs/assets/**), for the malicious
+          code scan to check only with high-signal rules and leave out of its Claude review; minified files always
+          are. Keep it narrow: a PR chooses its file paths, and nothing listed here should run in CI.
         required: false
         type: string
-        default: security/malicious-code-scan
+        default: ""
       sonar_project_key:
         description: SonarQube project key whose PR findings the reviewers fix (default is taken from the SonarQube Cloud check run)
         required: false
@@ -200,7 +201,6 @@ jobs:
       checks: read
       contents: read
       pull-requests: write
-      statuses: read
     # A uses: ref cannot be an expression; keep this on the ref callers use, as with shared_ref
     uses: OpenC3/.github/.github/workflows/ai-review-run.yml@main
     with:
@@ -213,9 +213,8 @@ jobs:
       codex_model: ${{ inputs.codex_model }}
       claude_max_budget_usd: ${{ inputs.claude_max_budget_usd }}
       codex_sandbox: ${{ inputs.codex_sandbox }}
-      scan_workflow_name: ${{ inputs.scan_workflow_name }}
-      scan_wait_minutes: ${{ inputs.scan_wait_minutes }}
-      scan_status_context: ${{ inputs.scan_status_context }}
+      scan_project_description: ${{ inputs.scan_project_description }}
+      scan_generated_paths: ${{ inputs.scan_generated_paths }}
       sonar_project_key: ${{ inputs.sonar_project_key }}
       sonar_wait_minutes: ${{ inputs.sonar_wait_minutes }}
       fix_mode: ${{ inputs.fix_mode }}

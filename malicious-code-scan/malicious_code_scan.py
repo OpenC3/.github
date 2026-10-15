@@ -28,9 +28,9 @@ Two layers:
     patterns cannot (a quiet backdoor, a disguised credential leak).
 
 The PR is only ever read as data: this script never checks out or executes
-PR code, which is what lets the workflow run it under pull_request_target
-with secrets. Findings are "block" (fails the check until a maintainer
-overrides) or "warn" (reported only).
+PR code, which is what lets the AI review workflow run it with secrets before
+any agent sees the PR. Findings are "block" (stops the AI review until a
+maintainer overrides) or "warn" (reported only).
 
 Writes GitHub annotations to stdout, a markdown report to --summary, and
 blocking, code_blocking (all but the PR title/body) and warnings counts to
