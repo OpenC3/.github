@@ -267,7 +267,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.tag_info.outputs.tag_name }}
-          release_name: ${{ steps.plugin_info.outputs.plugin_name }} v${{ inputs.version }}
+          # Single-plugin repos title the release with just the version, matching the tag.
+          # Multi-plugin repos keep the plugin name so their releases stay distinguishable.
+          release_name: ${{ inputs.plugin_directory == '.' && format('v{0}', inputs.version) || format('{0} v{1}', steps.plugin_info.outputs.plugin_name, inputs.version) }}
           body: |
             Release of ${{ steps.plugin_info.outputs.plugin_name }} version ${{ inputs.version }}
 
